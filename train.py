@@ -21,7 +21,7 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 
 import diffusers
-from diffusers import DDPMPipeline, DDPMScheduler, UNet2DModel, AutoencoderKL
+from diffusers import DDPMScheduler, UNet2DModel, AutoencoderKL, VQModel
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, is_accelerate_version, is_tensorboard_available, is_wandb_available
@@ -33,6 +33,10 @@ from src.pipeline import *
 check_min_version("0.27.0.dev0")
 
 logger = get_logger(__name__, log_level="INFO")
+
+# Change the info of your pretrained VAE model here
+VAE_PRETRAINED_PATH = "CompVis/ldm-celebahq-256"
+VAE_KWARGS = {"subfolder":"vqvae"}
 
 
 def _extract_into_tensor(arr, timesteps, broadcast_shape):
@@ -90,7 +94,7 @@ def parse_args():
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="ddpm-model-64",
+        default="ddpm-model-256",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument("--overwrite_output_dir", action="store_true")
@@ -139,7 +143,7 @@ def parse_args():
             " process."
         ),
     )
-    parser.add_argument("--num_epochs", type=int, default=100)
+    parser.add_argument("--num_epochs", type=int, default=150)
     parser.add_argument("--save_images_epochs", type=int, default=10, help="How often to save images during training.")
     parser.add_argument(
         "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
@@ -246,7 +250,7 @@ def parse_args():
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
-        default=None,
+        default=5,
         help=("Max number of checkpoints to store."),
     )
     parser.add_argument(
@@ -375,7 +379,7 @@ def main(args):
             ).repo_id
 
     # Load pretrained VAE model
-    vae = AutoencoderKL.from_pretrained("stabilityai/sd-vae-ft-ema")
+    vae = VQModel.from_pretrained(VAE_PRETRAINED_PATH, **VAE_KWARGS)
 
     # Freeze the VAE model
     vae.requires_grad_(False)
@@ -385,7 +389,7 @@ def main(args):
     # Initialize the model
     if args.model_config_name_or_path is None:
         model = UNet2DModel(sample_size=args.resolution // vae_scale_factor,
-                            in_channels=4, out_channels=4)
+                            in_channels=3, out_channels=3)
     else:
         config = UNet2DModel.load_config(args.model_config_name_or_path)
         model = UNet2DModel.from_config(config)
@@ -561,8 +565,8 @@ def main(args):
                 continue
 
             clean_images = batch["input"].to(weight_dtype)
-            latents = vae.encode(clean_images).latent_dist.sample()
-            latents = latents * vae.config.scaling_factor
+            latents = vae.encode(clean_images).latents
+            latents = latents * 0.18215#vae.config.scaling_factor
 
             # Sample noise that we'll add to the images
             noise = torch.randn(latents.shape, dtype=weight_dtype, device=latents.device)

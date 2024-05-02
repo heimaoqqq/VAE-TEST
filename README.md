@@ -7,25 +7,16 @@ Creating a training image set is [described in a different document](https://hug
 git clone https://github.com/zyinghua/uncond-image-generation-ldm.git
 ```
 
+Then call:
+```bash
+cd uncond-image-generation-ldm
+```
+
 ### Installing the dependencies
 
 Before running the scripts, make sure to install the library's training dependencies:
-
-**Important**
-
-This code repo is not independent yet and depends on the huggingface/diffusers library. Therefore please also install the diffusers library from source and keep in the same repository as this one.
-
-To make sure you can successfully run the latest versions of the example scripts, we highly recommend **installing from source** and keeping the install up to date as the huggingface team updates the example scripts frequently and install some example-specific requirements. To do this, execute the following steps in a new virtual environment:
-```bash
-git clone https://github.com/huggingface/diffusers
-cd diffusers
-pip install .
-```
-
-Then navigate to the uncond-image-generation-ldm folder containing the training script and install the required dependencies:
 ```bash
 pip install -r requirements.txt
-pip install peft
 ```
 
 And initialize an [🤗Accelerate](https://github.com/huggingface/accelerate/) environment with:
@@ -34,43 +25,45 @@ And initialize an [🤗Accelerate](https://github.com/huggingface/accelerate/) e
 accelerate config
 ```
 
+### Change Pretrained VAE settings
+You can specify which pretrained VAE model to use by changing the `VAE_PRETRAINED_PATH` and `VAE_KWARGS` variables in `train.py`, at the top.
+
 ### Unconditional Flowers
 
-The command to train a DDPM UNet model on the Oxford Flowers dataset:
+An examplar command to train a DDPM UNet model on the Oxford Flowers dataset, without using GPUs:
 
 ```bash
 accelerate launch train.py \
   --dataset_name="huggan/flowers-102-categories" \
-  --resolution=64 --center_crop --random_flip \
-  --output_dir="ddpm-ema-flowers-64" \
+  --resolution=256 \
+  --output_dir="ddpm-ema-flowers-256" \
   --train_batch_size=16 \
-  --num_epochs=100 \
+  --num_epochs=150 \
   --gradient_accumulation_steps=1 \
   --use_ema \
   --learning_rate=1e-4 \
   --lr_warmup_steps=500 \
   --mixed_precision=no \
-  --push_to_hub
 ```
 
 ### Training with multiple GPUs
 
-`accelerate` allows for seamless multi-GPU training. Follow the instructions [here](https://huggingface.co/docs/accelerate/basic_tutorials/launch)
+`accelerate` allows for seamless multi-GPU training. After setting up with `accelerate config`,
+simply add `--multi_gpu` in the command. For more information, follow the instructions [here](https://huggingface.co/docs/accelerate/basic_tutorials/launch)
 for running distributed training with `accelerate`. Here is an example command:
 
 ```bash
-accelerate launch --mixed_precision="fp16" --multi_gpu train.py \
-  --dataset_name="huggan/pokemon" \
-  --resolution=64 --center_crop --random_flip \
-  --output_dir="ddpm-ema-pokemon-64" \
+accelerate launch --multi_gpu train.py \
+  --dataset_name="huggan/flowers-102-categories" \
+  --resolution=256 \
+  --output_dir="ddpm-ema-flowers-256" \
   --train_batch_size=16 \
-  --num_epochs=100 \
+  --num_epochs=150 \
   --gradient_accumulation_steps=1 \
   --use_ema \
   --learning_rate=1e-4 \
   --lr_warmup_steps=500 \
-  --mixed_precision="fp16" \
-  --logger="wandb"
+  --mixed_precision=no \
 ```
 
 To be able to use Weights and Biases (`wandb`) as a logger you need to install the library: `pip install wandb`.
@@ -79,12 +72,12 @@ To be able to use Weights and Biases (`wandb`) as a logger you need to install t
 
 To use your own dataset, there are 3 ways:
 - you can either provide your own folder as `--train_data_dir`
-- or you can provide your own .zip file containing the data as '--train_data_files'
+- or you can provide your own .zip file containing the data as `--train_data_files`
 - or you can upload your dataset to the hub (possibly as a private repo, if you prefer so), and simply pass the `--dataset_name` argument.
 
 Below, we explain both in more detail.
 
-#### Provide the dataset as a folder
+#### Provide the dataset as a folder/zip file
 
 If you provide your own folders with images, the script expects the following directory structure:
 
@@ -102,40 +95,14 @@ accelerate launch train.py \
     <other-arguments>
 ```
 
+Or (if it is a zip file):
+```bash
+accelerate launch train.py \
+    --train_data_files <path-to-train-zip-file> \
+    <other-arguments>
+```
+
 Internally, the script will use the [`ImageFolder`](https://huggingface.co/docs/datasets/v2.0.0/en/image_process#imagefolder) feature which will automatically turn the folders into 🤗 Dataset objects.
 
-#### Upload your data to the hub, as a (possibly private) repo
+Official [diffusers](https://github.com/huggingface/diffusers) repo also has a pipeline for uncond ldm that can be found [here](https://github.com/huggingface/diffusers/tree/main/src/diffusers/pipelines/deprecated/latent_diffusion_uncond).
 
-It's very easy (and convenient) to upload your image dataset to the hub using the [`ImageFolder`](https://huggingface.co/docs/datasets/v2.0.0/en/image_process#imagefolder) feature available in 🤗 Datasets. Simply do the following:
-
-```python
-from datasets import load_dataset
-
-# example 1: local folder
-dataset = load_dataset("imagefolder", data_dir="path_to_your_folder")
-
-# example 2: local files (supported formats are tar, gzip, zip, xz, rar, zstd)
-dataset = load_dataset("imagefolder", data_files="path_to_zip_file")
-
-# example 3: remote files (supported formats are tar, gzip, zip, xz, rar, zstd)
-dataset = load_dataset("imagefolder", data_files="https://download.microsoft.com/download/3/E/1/3E1C3F21-ECDB-4869-8368-6DEBA77B919F/kagglecatsanddogs_3367a.zip")
-
-# example 4: providing several splits
-dataset = load_dataset("imagefolder", data_files={"train": ["path/to/file1", "path/to/file2"], "test": ["path/to/file3", "path/to/file4"]})
-```
-
-`ImageFolder` will create an `image` column containing the PIL-encoded images.
-
-Next, push it to the hub!
-
-```python
-# assuming you have ran the huggingface-cli login command in a terminal
-dataset.push_to_hub("name_of_your_dataset")
-
-# if you want to push to a private repo, simply pass private=True:
-dataset.push_to_hub("name_of_your_dataset", private=True)
-```
-
-and that's it! You can now train your model by simply setting the `--dataset_name` argument to the name of your dataset on the hub.
-
-More on this can also be found in [this blog post](https://huggingface.co/blog/image-search-datasets).
