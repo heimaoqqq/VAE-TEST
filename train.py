@@ -19,6 +19,8 @@ from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
+import numpy as np
+from PIL import Image
 
 import diffusers
 from diffusers import DDPMScheduler, UNet2DModel, AutoencoderKL, VQModel
@@ -35,8 +37,8 @@ check_min_version("0.27.0.dev0")
 logger = get_logger(__name__, log_level="INFO")
 
 # Change the info of your pretrained VAE model here
-VAE_PRETRAINED_PATH = "CompVis/ldm-celebahq-256"
-VAE_KWARGS = {"subfolder":"vqvae"}
+VAE_PRETRAINED_PATH = "CompVis/ldm-celebahq-256"  # 使用预训练的256x256 VAE模型
+VAE_KWARGS = {"subfolder":"vqvae"}  # 保持默认参数
 
 
 def _extract_into_tensor(arr, timesteps, broadcast_shape):
@@ -57,8 +59,94 @@ def _extract_into_tensor(arr, timesteps, broadcast_shape):
     return res.expand(broadcast_shape)
 
 
+def preprocess_microdoppler_data(data_dir, output_dir, image_size=256, max_samples=None):
+    """
+    预处理微多普勒时频图数据，确保所有图像尺寸一致且为RGB格式
+    
+    Args:
+        data_dir: 原始数据目录
+        output_dir: 处理后数据保存目录
+        image_size: 目标图像尺寸
+        max_samples: 最大样本数量，None表示处理所有样本
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # 图像转换
+    transform = transforms.Compose([
+        transforms.Resize((image_size, image_size), interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5]),
+    ])
+    
+    # 遍历所有用户目录
+    user_dirs = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
+    processed_count = 0
+    
+    for user_dir in tqdm(user_dirs, desc="处理用户数据"):
+        user_path = os.path.join(data_dir, user_dir)
+        output_user_path = os.path.join(output_dir, user_dir)
+        os.makedirs(output_user_path, exist_ok=True)
+        
+        # 获取所有图像文件
+        image_files = [f for f in os.listdir(user_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        
+        for img_file in image_files:
+            if max_samples is not None and processed_count >= max_samples:
+                print(f"已达到最大样本数 {max_samples}，停止处理")
+                return
+            
+            img_path = os.path.join(user_path, img_file)
+            output_img_path = os.path.join(output_user_path, img_file)
+            
+            try:
+                # 读取图像
+                img = Image.open(img_path)
+                
+                # 确保图像是RGB格式
+                if img.mode != 'RGB':
+                    img = img.convert('RGB')
+                
+                # 应用转换
+                processed_img = transform(img)
+                
+                # 转回PIL图像并保存
+                processed_img = ((processed_img + 1.0) * 127.5).clamp(0, 255).permute(1, 2, 0).numpy().astype(np.uint8)
+                processed_img = Image.fromarray(processed_img)
+                processed_img.save(output_img_path)
+                
+                processed_count += 1
+                
+            except Exception as e:
+                print(f"处理图像 {img_path} 时出错: {e}")
+    
+    print(f"成功处理 {processed_count} 张微多普勒时频图像")
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser.add_argument(
+        "--preprocess_only",
+        action="store_true",
+        help="只进行数据预处理，不训练模型",
+    )
+    parser.add_argument(
+        "--raw_data_dir",
+        type=str,
+        default=None,
+        help="原始微多普勒时频图数据目录，用于预处理",
+    )
+    parser.add_argument(
+        "--processed_data_dir",
+        type=str,
+        default=None,
+        help="预处理后的数据保存目录",
+    )
+    parser.add_argument(
+        "--max_samples",
+        type=int,
+        default=None,
+        help="预处理时的最大样本数量，None表示处理所有样本",
+    )
     parser.add_argument(
         "--dataset_name",
         type=str,
@@ -294,6 +382,14 @@ def parse_args():
 
 
 def main(args):
+    # 处理微多普勒数据
+    if args.raw_data_dir is not None and args.processed_data_dir is not None and not args.preprocess_only:
+        logger.info("检测到原始数据目录和处理后目录，执行数据预处理...")
+        preprocess_microdoppler_data(args.raw_data_dir, args.processed_data_dir, args.resolution, args.max_samples)
+        # 将处理后的数据目录设置为训练数据目录
+        args.train_data_dir = args.processed_data_dir
+        logger.info(f"预处理完成，将使用处理后的数据：{args.processed_data_dir}")
+    
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
 
@@ -722,4 +818,9 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    main(args)
+    if args.preprocess_only:
+        if args.raw_data_dir is None or args.processed_data_dir is None:
+            raise ValueError("When --preprocess_only is True, --raw_data_dir and --processed_data_dir must be specified.")
+        preprocess_microdoppler_data(args.raw_data_dir, args.processed_data_dir, args.resolution, args.max_samples)
+    else:
+        main(args)
