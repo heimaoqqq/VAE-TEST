@@ -25,6 +25,9 @@ from diffusers.utils.torch_utils import randn_tensor
 class LatentDiffusionPipelineBase(DiffusionPipeline):
     def decode_latents(self, latents):
         latents = latents / 0.18215
+        # 确保latents与vae的数据类型一致
+        dtype = self.vae.dtype if hasattr(self.vae, 'dtype') else self.vae.encoder.conv_in.weight.dtype
+        latents = latents.to(dtype)
         image = self.vae.decode(latents, return_dict=False)[0]
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloat16
