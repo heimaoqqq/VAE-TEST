@@ -252,6 +252,7 @@ class MicroDopplerDataset(torch.utils.data.Dataset):
         self.data_dir = Path(data_dir)
         self.resolution = resolution
         self.center_crop = center_crop
+        self.is_main_process = is_main_process # 保存状态
         
         # 设置转换
         self.transform = transforms.Compose([
@@ -269,7 +270,7 @@ class MicroDopplerDataset(torch.utils.data.Dataset):
         for folder_id in range(1, 32):  # 从1到31
             user_dir = self.data_dir / f"ID_{folder_id}"
             if not user_dir.exists():
-                if is_main_process:  # 只在主进程中打印警告
+                if self.is_main_process:  # 只在主进程中打印警告
                     print(f"警告: 文件夹ID_{folder_id}不存在 {user_dir}")
                 continue
                 
@@ -279,7 +280,7 @@ class MicroDopplerDataset(torch.utils.data.Dataset):
                 user_images = list(user_dir.glob("*.jpg"))
             
             if not user_images:
-                if is_main_process:  # 只在主进程中打印警告
+                if self.is_main_process:  # 只在主进程中打印警告
                     print(f"警告: 文件夹ID_{folder_id}没有图像文件")
                 continue
                 
@@ -293,7 +294,7 @@ class MicroDopplerDataset(torch.utils.data.Dataset):
             raise RuntimeError(f"在{data_dir}中找不到任何图像")
         
         # 只在主进程中打印数据集信息    
-        if is_main_process:
+        if self.is_main_process:
             print(f"加载了{len(self.image_paths)}张图像，来自{len(set(self.user_ids))}个用户")
             for folder_id in range(1, 32):
                 model_user_id = folder_id - 1
@@ -418,6 +419,7 @@ def main():
     dataset = MicroDopplerDataset(
         data_dir=args.dataset_path,
         resolution=args.resolution,
+        is_main_process=accelerator.is_main_process,
     )
     
     # 更新args.num_users以匹配数据集中找到的实际用户数
@@ -484,16 +486,21 @@ def main():
     first_epoch = 0
 
     # 进度条
-    progress_bar = tqdm(
-        range(global_step, args.max_train_steps), 
-        disable=not accelerator.is_local_main_process
-    )
-    progress_bar.set_description("训练步数")
+    
 
     for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
         train_loss = 0.0
-        for step, batch in enumerate(dataloader):
+        
+        # 为每轮设置独立的进度条和计时
+        epoch_progress_bar = tqdm(
+            dataloader, 
+            desc=f"Epoch {epoch + 1}/{args.num_train_epochs}",
+            disable=not accelerator.is_local_main_process
+        )
+        epoch_start_time = time.time()
+        
+        for step, batch in enumerate(epoch_progress_bar):
             with accelerator.accumulate(unet):
                 # 将图像编码到潜在空间
                 latents = vae.encode(batch["pixel_values"].to(accelerator.device)).latents
@@ -536,16 +543,31 @@ def main():
             if accelerator.sync_gradients:
                 if args.use_ema:
                     ema_unet.step(unet.parameters())
-                progress_bar.update(1)
                 global_step += 1
-                accelerator.log({"train_loss": train_loss}, step=global_step)
-                train_loss = 0.0
+
+            # 更新进度条的描述
+            epoch_progress_bar.set_postfix(loss=loss.detach().item(), lr=optimizer.param_groups[0]["lr"])
 
             if global_step >= args.max_train_steps:
                 break
         
-        # 每隔一定轮数保存模型
+        # --- 每轮结束后的日志输出 ---
         if accelerator.is_main_process:
+            epoch_duration = time.time() - epoch_start_time
+            avg_epoch_loss = train_loss / len(dataloader)
+            
+            # 格式化时间输出
+            hours, rem = divmod(epoch_duration, 3600)
+            minutes, seconds = divmod(rem, 60)
+            
+            logger.info(
+                f"Epoch {epoch + 1}/{args.num_train_epochs} | "
+                f"Avg Loss: {avg_epoch_loss:.4f} | "
+                f"Time: {int(hours):02d}:{int(minutes):02d}:{seconds:05.2f} | "
+                f"LR: {optimizer.param_groups[0]['lr']:.6f}"
+            )
+            
+            # 保存模型检查点
             if (epoch + 1) % args.save_model_epochs == 0 or epoch == args.num_train_epochs - 1:
                 # 正确获取要保存的UNet模型
                 unet_to_save = accelerator.unwrap_model(unet)
