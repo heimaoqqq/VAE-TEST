@@ -110,7 +110,12 @@ class CondUNet2DModel(nn.Module):
                 )
                 
                 # 将有效嵌入放回对应位置
-                user_embed[valid_mask] = valid_embeds
+                # 修改索引赋值操作，避免torch.compile的问题
+                # 原始代码: user_embed[valid_mask] = valid_embeds
+                # 使用scatter操作替代直接索引赋值
+                indices = torch.nonzero(valid_mask, as_tuple=True)[0]
+                for i, idx in enumerate(indices):
+                    user_embed[idx] = valid_embeds[i]
             
         # 使用原始UNet的时间嵌入部分
         timesteps = timestep
