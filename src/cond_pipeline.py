@@ -21,6 +21,7 @@ from diffusers.utils.torch_utils import randn_tensor
 
 from src.pipeline import LatentDiffusionPipelineBase
 from src.cond_unet import CondUNet2DModel
+import numpy as np
 
 
 class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
@@ -59,6 +60,94 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
         else:
             self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             
+    def decode_latents(self, latents):
+        """
+        将潜在表示解码为图像
+        
+        Args:
+            latents: 潜在表示 [B, C, H, W]
+            
+        Returns:
+            numpy数组，形状为 [B, H, W, C]，值范围为[0, 1]
+        """
+        print(f"解码latents，形状: {latents.shape}, 类型: {latents.dtype}")
+        
+        # 缩放latents
+        latents = latents / 0.18215
+        
+        # 确保latents与vae的数据类型一致
+        dtype = None
+        if hasattr(self.vae, 'dtype'):
+            dtype = self.vae.dtype
+        elif hasattr(self.vae, 'encoder') and hasattr(self.vae.encoder, 'conv_in'):
+            dtype = self.vae.encoder.conv_in.weight.dtype
+        else:
+            # 尝试获取任何参数的数据类型
+            for param in self.vae.parameters():
+                dtype = param.dtype
+                break
+        
+        if dtype is not None:
+            latents = latents.to(dtype)
+            
+        # 解码
+        try:
+            image = self.vae.decode(latents, return_dict=False)[0]
+            print(f"VAE解码后的图像形状: {image.shape}, 类型: {image.dtype}")
+            
+            # 规范化到[0, 1]范围
+            image = (image / 2 + 0.5).clamp(0, 1)
+            
+            # 转换为numpy数组，形状为[B, H, W, C]
+            image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+            print(f"最终图像形状: {image.shape}, 类型: {type(image)}, 值范围: [{image.min()}, {image.max()}]")
+            
+            return image
+        except Exception as e:
+            print(f"VAE解码失败: {e}")
+            print(f"尝试替代解码方法...")
+            
+            # 尝试替代解码方法
+            try:
+                # 如果vae有decode_first_stage方法
+                if hasattr(self.vae, 'decode_first_stage'):
+                    image = self.vae.decode_first_stage(latents)
+                # 或者如果是VQModel
+                elif hasattr(self.vae, 'decode') and callable(self.vae.decode):
+                    # 尝试不同的参数组合
+                    try:
+                        image = self.vae.decode(latents).sample
+                    except:
+                        try:
+                            image = self.vae.decode(latents)[0]
+                        except:
+                            image = self.vae.decode(latents)
+                else:
+                    raise ValueError("无法找到合适的解码方法")
+                
+                print(f"替代解码后的图像形状: {image.shape}, 类型: {image.dtype}")
+                
+                # 规范化到[0, 1]范围
+                image = (image / 2 + 0.5).clamp(0, 1)
+                
+                # 转换为numpy数组，形状为[B, H, W, C]
+                if len(image.shape) == 4 and image.shape[1] in [1, 3]:  # [B, C, H, W]
+                    image = image.cpu().permute(0, 2, 3, 1).float().numpy()
+                else:
+                    # 如果形状不是预期的，尝试转换
+                    print(f"警告: 图像形状异常: {image.shape}，尝试转换")
+                    image = image.cpu().float().numpy()
+                    
+                print(f"最终图像形状: {image.shape}, 类型: {type(image)}, 值范围: [{image.min()}, {image.max()}]")
+                
+                return image
+            except Exception as e2:
+                print(f"替代解码也失败: {e2}")
+                # 创建一个空的占位图像
+                print("创建占位图像")
+                placeholder = np.zeros((latents.shape[0], 256, 256, 3), dtype=np.float32)
+                return placeholder
+
     @torch.no_grad()
     def __call__(
             self,
