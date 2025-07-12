@@ -329,6 +329,850 @@ def main():
     kwargs = {}
     if torch.__version__ >= "2.0.0":
         # 如果PyTorch版本支持，添加更多优化选项
+        # 不再使用字符串，而是使用正确的方式或不设置该参数
+        try:
+            from accelerate.utils import DistributedDataParallelKwargs
+            ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+            kwargs["ddp_kwargs"] = ddp_kwargs
+        except ImportError:
+            logger.warning("无法导入DistributedDataParallelKwargs，跳过DDP优化")
+    
+    accelerator = Accelerator(
+        gradient_accumulation_steps=args.gradient_accumulation_steps,
+        mixed_precision=args.mixed_precision,
+        log_with=args.report_to,
+        project_config=accelerator_project_config,
+        **kwargs
+    )
+    
+    # 创建日志器
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO,
+    )
+    # 设置日志级别，减少不必要的输出
+    if accelerator.is_local_main_process:
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.ERROR)  # 非主进程只显示错误信息
+        
+    logger.info(accelerator.state, main_process_only=True)  # 只在主进程显示
+    
+    # 设置随机种子
+    if args.seed is not None:
+        set_seed(args.seed)
+        
+    # 处理输出目录
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+    
+    # 准备模型组件
+    logger.info(f"准备模型组件")
+    
+    # 检查是从头开始训练还是基于预训练模型
+    if args.pretrained_model_path and os.path.exists(args.pretrained_model_path):
+        logger.info(f"从预训练模型加载组件: {args.pretrained_model_path}")
+        # 加载预训练的无条件模型组件
+        from src.pipeline import UncondLatentDiffusionPipeline
+        temp_pipeline = UncondLatentDiffusionPipeline.from_pretrained(args.pretrained_model_path)
+        
+        # 提取组件
+        vae = temp_pipeline.vae
+        scheduler = temp_pipeline.scheduler
+        base_unet = temp_pipeline.unet
+        
+        # 释放临时pipeline
+        del temp_pipeline
+    else:
+        logger.info("从头初始化模型组件")
+        # 创建新的VAE模型
+        vae = VQModel(
+            in_channels=3,
+            out_channels=3,
+            down_block_types=["DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"],
+            up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"],
+            block_out_channels=[128, 256, 512],
+            latent_channels=3,
+            sample_size=args.resolution // 8,  # VAE的输出分辨率
+        )
+        
+        # 创建UNet模型
+        base_unet = UNet2DModel(
+            sample_size=args.resolution // 8,  # 与VAE的latent空间大小匹配
+            in_channels=3,
+            out_channels=3,
+            layers_per_block=2,
+            block_out_channels=(128, 256, 512, 512),
+            down_block_types=(
+                "DownBlock2D",
+                "DownBlock2D",
+                "AttnDownBlock2D",
+                "DownBlock2D",
+            ),
+            up_block_types=(
+                "UpBlock2D",
+                "AttnUpBlock2D",
+                "UpBlock2D",
+                "UpBlock2D",
+            ),
+        )
+        
+        # 创建调度器
+        scheduler = DDPMScheduler(
+            num_train_timesteps=1000,
+            beta_start=0.0001,
+            beta_end=0.02,
+            beta_schedule="linear",
+            clip_sample=False,
+        )
+    
+    # 创建条件UNet
+    logger.info(f"创建条件UNet模型，用户嵌入维度: {args.user_embed_dim}")
+    unet = CondUNet2DModel(
+        base_unet=base_unet, 
+        num_users=args.num_users, 
+        user_embed_dim=args.user_embed_dim,
+        freeze_unet=False  # 不冻结基础UNet，让整个网络一起训练
+    )
+    
+    # 如果PyTorch版本支持，使用torch.compile加速模型
+    if hasattr(torch, 'compile') and torch.__version__ >= "2.0.0":
+        logger.info("检测到PyTorch 2.0+，尝试使用torch.compile优化模型")
+        try:
+            # 检查是否在支持的平台上
+            supported = True
+            if torch.cuda.is_available():
+                # 检查CUDA版本是否支持
+                cuda_version = torch.version.cuda
+                if cuda_version is not None:
+                    major_version = int(cuda_version.split('.')[0])
+                    if major_version < 11:
+                        logger.warning(f"CUDA版本 {cuda_version} 可能不完全支持torch.compile，跳过优化")
+                        supported = False
+            
+            if supported:
+                try:
+                    # 尝试使用不同的编译模式
+                    compile_mode = "reduce-overhead"  # 更安全的模式
+                    logger.info(f"使用torch.compile优化模型，模式: {compile_mode}")
+                    unet = torch.compile(unet, mode=compile_mode)
+                except Exception as e:
+                    logger.warning(f"使用指定模式编译失败: {e}，尝试默认模式")
+                    try:
+                        unet = torch.compile(unet)
+                    except Exception as e2:
+                        logger.warning(f"torch.compile优化失败: {e2}，跳过优化")
+        except Exception as e:
+            logger.warning(f"torch.compile检查失败: {e}，跳过优化")
+    
+    # 设置调度器
+    noise_scheduler = scheduler
+    
+    # 加载数据集
+    train_dataset = MicroDopplerDataset(
+        data_dir=args.dataset_path,
+        resolution=args.resolution,
+        center_crop=True,
+        is_main_process=accelerator.is_main_process,
+    )
+    
+    # 确定最佳的num_workers数量
+    try:
+        import multiprocessing
+        num_cpus = multiprocessing.cpu_count()
+        # 在某些环境中，使用过多的worker可能导致问题
+        # 使用更保守的设置
+        num_workers = min(4, max(1, num_cpus // 2))  # 使用一半的CPU核心，最少1个，最多4个
+        logger.info(f"数据加载器使用 {num_workers} 个工作进程")
+    except Exception as e:
+        # 如果无法确定CPU数量，使用默认值
+        num_workers = 2
+        logger.warning(f"无法确定CPU数量: {e}，使用默认值 {num_workers} 个工作进程")
+    
+    # 创建数据加载器
+    try:
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.train_batch_size,
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,  # 使用pin_memory加速数据传输
+            drop_last=True,  # 丢弃不完整的批次，避免批次大小不一致
+        )
+    except Exception as e:
+        # 如果使用高级选项失败，回退到基本设置
+        logger.warning(f"使用高级数据加载器选项失败: {e}，回退到基本设置")
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.train_batch_size,
+            shuffle=True,
+            num_workers=0,  # 不使用额外的工作进程
+        )
+    
+    # 计算训练步数 - 在创建优化器和学习率调度器之前
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * len(train_dataloader)
+        logger.info(f"设置总训练步数为: {args.max_train_steps}")
+    else:
+        args.num_train_epochs = math.ceil(args.max_train_steps / len(train_dataloader))
+        logger.info(f"根据max_train_steps计算训练轮数: {args.num_train_epochs}")
+    
+    # 设置优化器
+    if args.use_8bit_adam:
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError(
+                "要使用 8-bit Adam，请先安装bitsandbytes: `pip install bitsandbytes`"
+            )
+        optimizer_cls = bnb.optim.AdamW8bit
+    else:
+        optimizer_cls = torch.optim.AdamW
+        
+    params_to_optimize = unet.parameters()
+    
+    optimizer = optimizer_cls(
+        params_to_optimize,
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
+    
+    # 设置学习率调度器 - 现在max_train_steps已经计算好了
+    lr_scheduler = get_scheduler(
+        args.lr_scheduler,
+        optimizer=optimizer,
+        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
+        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+    )
+    
+    # 准备加速器
+    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, train_dataloader, lr_scheduler
+    )
+    
+    # 设置EMA
+    if args.use_ema:
+        ema_unet = CondUNet2DModel(
+            base_unet=base_unet,
+            num_users=args.num_users,
+            user_embed_dim=args.user_embed_dim
+        )
+        ema_unet.to(accelerator.device)
+        # 修复EMA初始化，不使用model_config参数
+        ema_model = EMAModel(
+            ema_unet.parameters(),
+            decay=0.9999
+        )
+    
+    # 设置xFormers优化
+    if args.enable_xformers_memory_efficient_attention:
+        if is_xformers_available():
+            unet.unet.enable_xformers_memory_efficient_attention()
+        else:
+            raise ValueError("xFormers未安装，无法启用内存高效注意力")
+    
+    # 启用TF32精度
+    if args.allow_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    
+    # 权重数据类型
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+        
+    # 将VAE移动到设备上并设置为评估模式
+    vae.to(accelerator.device, dtype=weight_dtype)
+    vae.eval()
+    
+    # 打印训练信息摘要
+    if accelerator.is_main_process:
+        total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+        logger.info("***** 训练信息 *****")
+        logger.info(f"  数据集大小 = {len(train_dataset)}")
+        logger.info(f"  轮次数 = {args.num_train_epochs}")
+        logger.info(f"  每个设备的批次大小 = {args.train_batch_size}")
+        logger.info(f"  总批次大小 (包括并行、分布式和梯度累积) = {total_batch_size}")
+        logger.info(f"  梯度累积步数 = {args.gradient_accumulation_steps}")
+        logger.info(f"  总训练步数 = {args.max_train_steps}")
+        logger.info(f"  混合精度 = {args.mixed_precision}")
+        logger.info(f"  用户数量 = {args.num_users}")
+        logger.info(f"  用户嵌入维度 = {args.user_embed_dim}")
+        logger.info(f"  无条件训练概率 = {args.uncond_prob}")
+        logger.info("**********************")
+    
+    # 计算每个轮次的更新步数
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    
+    # 设置进度条 - 使用轮次而非总步数
+    progress_bar = tqdm(range(args.num_train_epochs), 
+                        disable=not accelerator.is_local_main_process,
+                        dynamic_ncols=True,  # 动态调整宽度
+                        leave=True)  # 保留进度条
+    progress_bar.set_description("训练轮次")
+    
+    global_step = 0
+    
+    # 从检查点恢复训练
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint != "latest":
+            path = os.path.basename(args.resume_from_checkpoint)
+        else:
+            # 获取最新检查点
+            dirs = os.listdir(args.output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1] if len(dirs) > 0 else None
+            
+        if path is None:
+            accelerator.print(f"检查点'{args.resume_from_checkpoint}'未找到，从头开始训练")
+            args.resume_from_checkpoint = None
+        else:
+            accelerator.print(f"从检查点'{path}'恢复训练")
+            path = os.path.join(args.output_dir, path)
+            accelerator.load_state(path)
+            global_step = int(path.split("-")[1])
+            
+            # 计算对应的轮次和步骤
+            resume_epoch = global_step // num_update_steps_per_epoch
+            resume_step = global_step % num_update_steps_per_epoch
+            
+            # 更新进度条
+            progress_bar.update(resume_epoch)
+            progress_bar.set_description(f"从轮次 {resume_epoch} 恢复训练")
+            
+            logger.info(f"从步骤 {global_step} (轮次 {resume_epoch}, 步骤 {resume_step}) 恢复训练")
+    
+    # 启用性能分析
+    torch.cuda.empty_cache()  # 清空缓存，确保有足够的GPU内存
+    
+    # 显示GPU信息
+    if torch.cuda.is_available() and accelerator.is_local_main_process:
+        try:
+            gpu_count = torch.cuda.device_count()
+            logger.info(f"可用GPU数量: {gpu_count}")
+            for i in range(gpu_count):
+                gpu_name = torch.cuda.get_device_name(i)
+                gpu_mem = torch.cuda.get_device_properties(i).total_memory / (1024**3)  # GB
+                logger.info(f"GPU {i}: {gpu_name}, 内存: {gpu_mem:.2f} GB")
+        except Exception as e:
+            logger.warning(f"无法获取GPU信息: {e}")
+    
+    # 训练循环
+    for epoch in range(args.num_train_epochs):
+        unet.train()
+        # 为每个轮次创建一个内部进度条
+        epoch_progress_bar = tqdm(total=len(train_dataloader), 
+                                  disable=not accelerator.is_local_main_process,
+                                  dynamic_ncols=True,  # 动态调整宽度
+                                  leave=False,  # 不保留进度条，只显示当前轮次
+                                  position=0,   # 固定位置
+                                  mininterval=0.5)  # 减少更新频率，提高性能
+        epoch_progress_bar.set_description(f"轮次 {epoch+1}/{args.num_train_epochs}")
+        
+        # 记录每个轮次的平均损失
+        epoch_loss = 0.0
+        
+        for step, batch in enumerate(train_dataloader):
+            with accelerator.accumulate(unet):
+                # 转换为潜在表示
+                clean_images = batch["input"].to(accelerator.device, non_blocking=True)
+                with torch.no_grad():
+                    latents = vae.encode(clean_images).latents
+                    latents = latents * 0.18215
+                
+                # 获取用户ID
+                user_ids = batch["user_id"].to(accelerator.device, non_blocking=True)
+                
+                # 随机丢弃部分条件（对无条件生成能力建模）
+                batch_size = clean_images.shape[0]
+                uncond_mask = torch.rand(batch_size, device=accelerator.device) < args.uncond_prob
+                if uncond_mask.any():
+                    # 对于标记为无条件的样本，将user_ids设为-1
+                    user_ids_with_uncond = user_ids.clone()
+                    user_ids_with_uncond[uncond_mask] = -1  # 使用-1表示无条件
+                    user_ids = user_ids_with_uncond
+                
+                # 采样噪声
+                noise = torch.randn_like(latents)
+                
+                # 采样时间步
+                timesteps = torch.randint(
+                    0, noise_scheduler.config.num_train_timesteps, 
+                    (batch_size,), 
+                    device=latents.device
+                ).long()
+                
+                # 添加噪声
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+                
+                # 预测噪声
+                model_pred = unet(noisy_latents, timesteps, user_ids=user_ids).sample
+                
+                # 计算损失
+                loss = F.mse_loss(model_pred, noise, reduction="mean")
+                
+                # 反向传播
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(unet.parameters(), 1.0)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)  # 使用set_to_none=True减少内存使用
+                
+                # 累积损失
+                epoch_loss += loss.detach().item()
+                
+            # 更新EMA模型
+            if args.use_ema and accelerator.sync_gradients:
+                ema_model.step(unet.parameters())
+                
+            # 更新步数
+            if accelerator.sync_gradients:
+                global_step += 1
+                
+                # 保存检查点
+                if global_step % args.checkpointing_steps == 0:
+                    if accelerator.is_main_process:
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        # 使用进度条而非日志记录检查点信息
+                        epoch_progress_bar.write(f"保存检查点到 {save_path}")
+                        
+                        # 删除旧检查点
+                        if args.checkpoints_total_limit is not None:
+                            checkpoints = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                            
+                            if len(checkpoints) > args.checkpoints_total_limit:
+                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit
+                                for old_ckpt in checkpoints[:num_to_remove]:
+                                    old_ckpt_path = os.path.join(args.output_dir, old_ckpt)
+                                    shutil.rmtree(old_ckpt_path)
+                                    epoch_progress_bar.write(f"删除旧检查点 {old_ckpt_path}")
+                
+            # 更新内部进度条，显示当前步骤和损失
+            if step % 5 == 0:  # 减少进度条更新频率
+                current_loss = loss.detach().item()
+                current_lr = lr_scheduler.get_last_lr()[0]
+                epoch_progress_bar.set_postfix(
+                    loss=f"{current_loss:.4f}",
+                    lr=f"{current_lr:.6f}"
+                )
+                epoch_progress_bar.update(min(5, len(train_dataloader) - epoch_progress_bar.n))
+            
+        # 确保进度条完成
+        epoch_progress_bar.update(len(train_dataloader) - epoch_progress_bar.n)
+        
+        # 计算平均损失
+        avg_loss = epoch_loss / len(train_dataloader)
+        
+        # 关闭内部进度条
+        epoch_progress_bar.close()
+        
+        # 更新外部进度条，显示平均损失
+        progress_bar.set_postfix(
+            avg_loss=f"{avg_loss:.4f}",
+            last_lr=f"{lr_scheduler.get_last_lr()[0]:.6f}"
+        )
+        progress_bar.update(1)
+        
+        # 每轮结束时清理缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        # 保存模型
+        if accelerator.is_main_process:
+            if epoch % args.save_model_epochs == 0 or epoch == args.num_train_epochs - 1:
+                # 使用EMA模型或当前模型
+                if args.use_ema:
+                    ema_model.store(unet.parameters())
+                    ema_model.copy_to(unet.parameters())
+                    
+                # 获取unwrapped模型
+                unet_unwrapped = accelerator.unwrap_model(unet)
+                
+                # 保存条件UNet模型
+                pipeline = CondLatentDiffusionPipeline(
+                    vae=vae,
+                    unet=unet_unwrapped,
+                    scheduler=scheduler,
+                )
+                
+                # 保存pipeline
+                pipeline.save_pretrained(args.output_dir)
+                
+                # 恢复原始权重
+                if args.use_ema:
+                    ema_model.restore(unet.parameters())
+        
+        # 检查是否完成训练
+        if global_step >= args.max_train_steps:
+            break
+    
+    # 保存最终模型
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        # 使用EMA模型或当前模型
+        if args.use_ema:
+            ema_model.store(unet.parameters())
+            ema_model.copy_to(unet.parameters())
+            
+        # 获取unwrapped模型
+        unet = accelerator.unwrap_model(unet)
+        
+        # 保存条件UNet模型
+        pipeline = CondLatentDiffusionPipeline(
+            vae=vae,
+            unet=unet,
+            scheduler=scheduler,
+        )
+        
+        # 保存pipeline
+        pipeline.save_pretrained(args.output_dir)
+        
+        # 恢复原始权重
+        if args.use_ema:
+            ema_model.restore(unet.parameters())
+    
+    accelerator.end_training()
+
+if __name__ == "__main__":
+    main() import argparse
+import logging
+import math
+import os
+import random
+import shutil
+import warnings
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+import torch.utils.checkpoint
+import transformers
+from accelerate import Accelerator
+from accelerate.logging import get_logger
+from accelerate.utils import ProjectConfiguration, set_seed
+from huggingface_hub import HfFolder, Repository, whoami
+from packaging import version
+from torchvision import transforms
+from tqdm.auto import tqdm
+from transformers import CLIPTextModel, CLIPTokenizer
+from PIL import Image
+
+import diffusers
+from diffusers import (
+    AutoencoderKL,
+    DDPMScheduler,
+    VQModel,
+    UNet2DModel,
+)
+from diffusers.optimization import get_scheduler
+from diffusers.training_utils import EMAModel
+from diffusers.utils import check_min_version, deprecate
+from diffusers.utils.import_utils import is_xformers_available
+
+from src.cond_unet import CondUNet2DModel
+from src.cond_pipeline import CondLatentDiffusionPipeline
+
+logger = get_logger(__name__, log_level="INFO")
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="训练条件潜在扩散模型")
+    parser.add_argument(
+        "--pretrained_model_path",
+        type=str,
+        default=None,
+        required=False,  # 修改为可选参数
+        help="预训练模型的路径，如不提供则从头训练",
+    )
+    parser.add_argument(
+        "--dataset_path",
+        type=str,
+        default=None,
+        required=True,
+        help="数据集路径，包含多个用户的微多普勒时频图",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="output",
+        help="模型保存路径",
+    )
+    parser.add_argument(
+        "--seed", 
+        type=int, 
+        default=42, 
+        help="随机种子"
+    )
+    parser.add_argument(
+        "--resolution",
+        type=int,
+        default=256,
+        help="训练分辨率",
+    )
+    parser.add_argument(
+        "--train_batch_size", 
+        type=int, 
+        default=16, 
+        help="训练批次大小"
+    )
+    parser.add_argument(
+        "--save_model_epochs", 
+        type=int, 
+        default=10, 
+        help="每多少轮保存模型"
+    )
+    parser.add_argument(
+        "--num_train_epochs", 
+        type=int, 
+        default=100, 
+        help="训练轮数"
+    )
+    parser.add_argument(
+        "--max_train_steps",
+        type=int,
+        default=None,
+        help="最大训练步数，如果设置，将覆盖num_train_epochs",
+    )
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=1,
+        help="梯度累积步数",
+    )
+    parser.add_argument(
+        "--learning_rate",
+        type=float,
+        default=1e-4,
+        help="初始学习率",
+    )
+    parser.add_argument(
+        "--lr_scheduler",
+        type=str,
+        default="constant",
+        help="学习率调度器类型",
+        choices=[
+            "linear",
+            "cosine",
+            "cosine_with_restarts",
+            "polynomial",
+            "constant",
+            "constant_with_warmup",
+        ],
+    )
+    parser.add_argument(
+        "--lr_warmup_steps", 
+        type=int, 
+        default=500, 
+        help="学习率预热步数"
+    )
+    parser.add_argument(
+        "--use_8bit_adam", 
+        action="store_true", 
+        help="是否使用8-bit Adam优化器"
+    )
+    parser.add_argument(
+        "--use_ema", 
+        action="store_true", 
+        help="是否使用EMA模型平均"
+    )
+    parser.add_argument(
+        "--adam_beta1", 
+        type=float, 
+        default=0.9, 
+        help="Adam优化器beta1"
+    )
+    parser.add_argument(
+        "--adam_beta2", 
+        type=float, 
+        default=0.999, 
+        help="Adam优化器beta2"
+    )
+    parser.add_argument(
+        "--adam_weight_decay", 
+        type=float, 
+        default=1e-2, 
+        help="Adam优化器权重衰减"
+    )
+    parser.add_argument(
+        "--adam_epsilon", 
+        type=float, 
+        default=1e-08, 
+        help="Adam优化器epsilon"
+    )
+    parser.add_argument(
+        "--user_embed_dim",
+        type=int,
+        default=64,
+        help="用户嵌入维度",
+    )
+    parser.add_argument(
+        "--uncond_prob",
+        type=float,
+        default=0.1,
+        help="无条件训练概率，模型学习在没有用户ID时也能生成图像",
+    )
+    parser.add_argument(
+        "--mixed_precision",
+        type=str,
+        default="no",
+        choices=["no", "fp16", "bf16"],
+        help="是否使用混合精度训练",
+    )
+    parser.add_argument(
+        "--allow_tf32",
+        action="store_true",
+        help="是否允许TF32精度",
+    )
+    parser.add_argument(
+        "--report_to",
+        type=str,
+        default="tensorboard",
+        help="要报告的跟踪器",
+    )
+    parser.add_argument(
+        "--local_rank", 
+        type=int, 
+        default=-1, 
+        help="用于分布式训练的本地进程排名"
+    )
+    parser.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=1000,
+        help="每多少步保存一次检查点",
+    )
+    parser.add_argument(
+        "--checkpoints_total_limit",
+        type=int,
+        default=5,
+        help="保存的检查点总数限制",
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help="如果指定，将从该检查点恢复训练",
+    )
+    parser.add_argument(
+        "--enable_xformers_memory_efficient_attention", 
+        action="store_true", 
+        help="是否使用xFormers优化注意力计算"
+    )
+    parser.add_argument(
+        "--num_users",
+        type=int,
+        default=31,
+        help="总用户数量",
+    )
+    args = parser.parse_args()
+    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    if env_local_rank != -1 and env_local_rank != args.local_rank:
+        args.local_rank = env_local_rank
+
+    return args
+
+
+class MicroDopplerDataset(torch.utils.data.Dataset):
+    """
+    微多普勒时频图像数据集，用于条件生成
+    """
+    def __init__(
+        self,
+        data_dir,
+        resolution=256,
+        center_crop=False,
+        is_main_process=True,  # 添加参数以确定是否为主进程
+    ):
+        self.data_dir = Path(data_dir)
+        self.resolution = resolution
+        self.center_crop = center_crop
+        
+        # 设置转换
+        self._transform = transforms.Compose([
+            transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(resolution) if center_crop else transforms.RandomCrop(resolution),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ])
+        
+        # 收集所有图像文件并按用户ID分组
+        self.image_paths = []
+        self.user_ids = []
+        
+        # 适应ID_1到ID_31的文件夹结构
+        for folder_id in range(1, 32):  # 从1到31
+            user_dir = self.data_dir / f"ID_{folder_id}"
+            if not user_dir.exists():
+                if is_main_process:  # 只在主进程中打印警告
+                    print(f"警告: 文件夹ID_{folder_id}不存在 {user_dir}")
+                continue
+                
+            # 获取该用户的所有图像文件
+            user_images = list(user_dir.glob("*.png"))
+            if not user_images:
+                user_images = list(user_dir.glob("*.jpg"))
+            
+            if not user_images:
+                if is_main_process:  # 只在主进程中打印警告
+                    print(f"警告: 文件夹ID_{folder_id}没有图像文件")
+                continue
+                
+            self.image_paths.extend(user_images)
+            
+            # 用户ID从0开始，文件夹从1开始，所以要减1进行映射
+            model_user_id = folder_id - 1
+            self.user_ids.extend([model_user_id] * len(user_images))
+            
+        if not self.image_paths:
+            raise RuntimeError(f"在{data_dir}中找不到任何图像")
+        
+        # 只在主进程中打印数据集信息    
+        if is_main_process:
+            print(f"加载了{len(self.image_paths)}张图像，来自{len(set(self.user_ids))}个用户")
+            for folder_id in range(1, 32):
+                model_user_id = folder_id - 1
+                count = self.user_ids.count(model_user_id)
+                if count > 0:
+                    print(f"  - ID_{folder_id} (内部ID: {model_user_id}) 有 {count} 张图像")
+        
+    def __len__(self):
+        return len(self.image_paths)
+        
+    def __getitem__(self, idx):
+        image_path = self.image_paths[idx]
+        user_id = self.user_ids[idx]
+        
+        image = Image.open(image_path).convert("RGB")
+        
+        if self._transform is not None:
+            image = self._transform(image)
+            
+        return {
+            "input": image,
+            "user_id": user_id,
+        }
+
+
+def main():
+    args = parse_args()
+    
+    logging_dir = os.path.join(args.output_dir, "logs")
+    accelerator_project_config = ProjectConfiguration(
+        project_dir=args.output_dir, logging_dir=logging_dir
+    )
+    
+    # 添加优化选项
+    kwargs = {}
+    if torch.__version__ >= "2.0.0":
+        # 如果PyTorch版本支持，添加更多优化选项
         kwargs["gradient_accumulation_plugin"] = "ddp_find_unused_parameters_false"
     
     accelerator = Accelerator(
