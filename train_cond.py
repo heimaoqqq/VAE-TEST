@@ -547,11 +547,16 @@ def main():
         # 每隔一定轮数保存模型
         if accelerator.is_main_process:
             if (epoch + 1) % args.save_model_epochs == 0 or epoch == args.num_train_epochs - 1:
+                # 正确获取要保存的UNet模型
+                unet_to_save = accelerator.unwrap_model(unet)
+                if args.use_ema:
+                    ema_unet.copy_to(unet_to_save.parameters())
+                
                 # 创建pipeline并保存
                 pipeline = CondLatentDiffusionPipeline(
                     vae=vae,
                     scheduler=noise_scheduler,
-                    unet=accelerator.unwrap_model(unet) if not args.use_ema else ema_unet.averaged_model
+                    unet=unet_to_save
                 )
                 pipeline.save_pretrained(os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}"))
                 logger.info(f"在 epoch {epoch+1} 保存模型检查点")
