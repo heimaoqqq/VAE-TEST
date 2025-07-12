@@ -122,18 +122,43 @@ class CondUNet2DModel(nn.Module):
         # 确保时间步与批次大小匹配
         timesteps = timesteps.expand(sample.shape[0])
         
-        t_emb = self.unet.time_proj(timesteps)
-        t_emb = self.unet.time_embedding(t_emb)
+        # 安全访问time_proj和time_embedding，处理DataParallel的情况
+        try:
+            t_emb = self.unet.time_proj(timesteps)
+            t_emb = self.unet.time_embedding(t_emb)
+        except AttributeError:
+            # 如果是DataParallel模型，尝试通过module访问
+            if hasattr(self.unet, 'module'):
+                t_emb = self.unet.module.time_proj(timesteps)
+                t_emb = self.unet.module.time_embedding(t_emb)
+            else:
+                # 检查是否自己是DataParallel
+                if isinstance(self.unet, nn.DataParallel) or isinstance(self.unet, nn.parallel.DistributedDataParallel):
+                    t_emb = self.unet.module.time_proj(timesteps)
+                    t_emb = self.unet.module.time_embedding(t_emb)
+                else:
+                    raise AttributeError("无法访问time_proj属性，模型结构可能有问题")
         
         # 现在我们需要将条件注入到UNet的各个阶段
         # 这需要重新实现UNet的前向传播流程
         
+        # 安全访问UNet的组件
+        def safe_access(obj, attr_name):
+            try:
+                return getattr(obj, attr_name)
+            except AttributeError:
+                if hasattr(obj, 'module'):
+                    return getattr(obj.module, attr_name)
+                raise
+        
         # 1. 初始卷积
-        x = self.unet.conv_in(sample)
+        conv_in = safe_access(self.unet, 'conv_in')
+        x = conv_in(sample)
         
         # 2. 下采样阶段
+        down_blocks = safe_access(self.unet, 'down_blocks')
         down_block_res_samples = (x,)
-        for i, downsample_block in enumerate(self.unet.down_blocks):
+        for i, downsample_block in enumerate(down_blocks):
             if user_embed is not None and i < len(self.down_film_layers):
                 # 正常处理下采样块
                 x, res_samples = downsample_block(
@@ -148,12 +173,14 @@ class CondUNet2DModel(nn.Module):
             down_block_res_samples += res_samples
             
         # 3. 中间层处理
-        x = self.unet.mid_block(x, t_emb)
+        mid_block = safe_access(self.unet, 'mid_block')
+        x = mid_block(x, t_emb)
         if user_embed is not None:
             x = self.mid_film_layer(x, user_embed)
             
         # 4. 上采样阶段
-        for i, upsample_block in enumerate(self.unet.up_blocks):
+        up_blocks = safe_access(self.unet, 'up_blocks')
+        for i, upsample_block in enumerate(up_blocks):
             res_samples = down_block_res_samples[-len(upsample_block.resnets) :]
             down_block_res_samples = down_block_res_samples[: -len(upsample_block.resnets)]
             
@@ -169,9 +196,13 @@ class CondUNet2DModel(nn.Module):
                 x = self.up_film_layers[i](x, user_embed)
                 
         # 5. 最终输出
-        x = self.unet.conv_norm_out(x)
-        x = self.unet.conv_act(x)
-        x = self.unet.conv_out(x)
+        conv_norm_out = safe_access(self.unet, 'conv_norm_out')
+        conv_act = safe_access(self.unet, 'conv_act')
+        conv_out = safe_access(self.unet, 'conv_out')
+        
+        x = conv_norm_out(x)
+        x = conv_act(x)
+        x = conv_out(x)
         
         if not return_dict:
             return (x,)
