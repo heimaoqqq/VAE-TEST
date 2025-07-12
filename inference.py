@@ -80,14 +80,10 @@ try:
         unet=cond_unet
     )
 
-    # 首先将VAE移动到设备
+    # 移动模型到设备
     print(f"将模型移动到设备 {device}...")
     vae = vae.to(device)
-    
-    # 然后将UNet移动到设备
     cond_unet = cond_unet.to(device)
-    
-    # 最后将整个pipeline移动到设备
     pipeline = pipeline.to(device)
     
     load_time = time.time() - start_time
