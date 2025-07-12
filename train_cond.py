@@ -711,24 +711,8 @@ def main():
                     "lr": lr_scheduler.get_last_lr()[0],
                 }, step=global_step)
                 
-                # 保存检查点
-                if global_step % args.checkpointing_steps == 0:
-                    if accelerator.is_main_process:
-                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        
-                        # 静默保存
-                        original_stdout = sys.stdout
-                        sys.stdout = open(os.devnull, 'w')
-                        try:
-                            accelerator.save_state(save_path)
-                        finally:
-                            sys.stdout.close()
-                            sys.stdout = original_stdout
-                        
-                        # 简短通知
-                        if accelerator.is_local_main_process:
-                            print(f"\n保存检查点到 {save_path}")
-        
+                # 移除按步数保存检查点的逻辑
+    
         # 计算平均损失
         avg_loss = epoch_loss / epoch_step if epoch_step > 0 else 0
         end_time = time.time()
@@ -744,6 +728,30 @@ def main():
                   f"平均损失: {avg_loss:.4f} | "
                   f"学习率: {lr_scheduler.get_last_lr()[0]:.6f} | "
                   f"步数: {global_step}")
+        
+        # 每个epoch结束时保存检查点
+        if accelerator.is_main_process:
+            # 创建检查点路径
+            checkpoint_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
+            
+            # 删除旧的检查点（保留当前epoch的检查点）
+            checkpoints = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint-epoch-")]
+            for old_ckpt in checkpoints:
+                old_ckpt_path = os.path.join(args.output_dir, old_ckpt)
+                if old_ckpt_path != checkpoint_path and os.path.exists(old_ckpt_path):
+                    shutil.rmtree(old_ckpt_path, ignore_errors=True)
+            
+            # 静默保存检查点
+            if accelerator.is_local_main_process:
+                print(f"保存检查点到 {checkpoint_path}")
+            
+            original_stdout = sys.stdout
+            sys.stdout = open(os.devnull, 'w')
+            try:
+                accelerator.save_state(checkpoint_path)
+            finally:
+                sys.stdout.close()
+                sys.stdout = original_stdout
         
         # 每轮结束时清理缓存
         if torch.cuda.is_available():
@@ -761,7 +769,6 @@ def main():
                 unet_unwrapped = accelerator.unwrap_model(unet)
                 
                 # 保存条件UNet模型 - 修改为分别保存组件
-                # logger.info(f"保存模型到 {args.output_dir}")
                 print(f"保存模型到 {args.output_dir}")
                 
                 # 清理旧的模型文件
@@ -769,10 +776,8 @@ def main():
                 for file_or_dir in model_files:
                     path = os.path.join(args.output_dir, file_or_dir)
                     if os.path.isdir(path):
-                        # logger.info(f"删除目录: {file_or_dir}")
                         shutil.rmtree(path, ignore_errors=True)
                     elif os.path.isfile(path):
-                        # logger.info(f"删除文件: {file_or_dir}")
                         os.remove(path)
                 
                 # 分别保存各组件
@@ -809,8 +814,6 @@ def main():
         unet = accelerator.unwrap_model(unet)
         
         # 保存条件UNet模型 - 修改为分别保存组件
-        # logger.info(f"保存最终模型到 {args.output_dir}")
-        # progress_bar.write(f"保存最终模型到 {args.output_dir}") # 移除tqdm更新
         print(f"保存最终模型到 {args.output_dir}")
         
         # 清理旧的模型文件
@@ -818,10 +821,8 @@ def main():
         for file_or_dir in model_files:
             path = os.path.join(args.output_dir, file_or_dir)
             if os.path.isdir(path):
-                # logger.info(f"删除目录: {file_or_dir}")
                 shutil.rmtree(path, ignore_errors=True)
             elif os.path.isfile(path):
-                # logger.info(f"删除文件: {file_or_dir}")
                 os.remove(path)
         
         # 分别保存各组件
