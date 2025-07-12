@@ -641,6 +641,8 @@ def main():
                 # 转换为潜在表示
                 clean_images = batch["input"].to(accelerator.device, non_blocking=True)
                 with torch.no_grad():
+                    # 确保输入图像与VAE使用相同的数据类型
+                    clean_images = clean_images.to(dtype=weight_dtype)
                     latents = vae.encode(clean_images).latents
                     latents = latents * 0.18215
                 
