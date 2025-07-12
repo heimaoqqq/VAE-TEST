@@ -701,7 +701,20 @@ def main():
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
+                        
+                        # 临时重定向标准输出以抑制详细日志
+                        import sys
+                        import os
+                        original_stdout = sys.stdout
+                        sys.stdout = open(os.devnull, 'w')
+                        
+                        try:
+                            accelerator.save_state(save_path)
+                        finally:
+                            # 恢复标准输出
+                            sys.stdout.close()
+                            sys.stdout = original_stdout
+                            
                         # 使用进度条而非日志记录检查点信息
                         epoch_progress_bar.write(f"保存检查点到 {save_path}")
                         
@@ -758,15 +771,34 @@ def main():
                 # 获取unwrapped模型
                 unet_unwrapped = accelerator.unwrap_model(unet)
                 
-                # 保存条件UNet模型
-                pipeline = CondLatentDiffusionPipeline(
-                    vae=vae,
-                    unet=unet_unwrapped,
-                    scheduler=scheduler,
-                )
+                # 保存条件UNet模型 - 修改为分别保存组件
+                logger.info(f"保存模型到 {args.output_dir}")
                 
-                # 保存pipeline
-                pipeline.save_pretrained(args.output_dir)
+                # 清理旧的模型文件
+                model_files = ["model_index.json", "scheduler", "unet", "vae"]
+                for file_or_dir in model_files:
+                    path = os.path.join(args.output_dir, file_or_dir)
+                    if os.path.isdir(path):
+                        logger.info(f"删除目录: {file_or_dir}")
+                        shutil.rmtree(path, ignore_errors=True)
+                    elif os.path.isfile(path):
+                        logger.info(f"删除文件: {file_or_dir}")
+                        os.remove(path)
+                
+                # 分别保存各组件
+                unet_unwrapped.save_pretrained(os.path.join(args.output_dir, "unet"))
+                scheduler.save_pretrained(os.path.join(args.output_dir, "scheduler"))
+                vae.save_pretrained(os.path.join(args.output_dir, "vae"))
+                
+                # 创建model_index.json
+                import json
+                model_index = {
+                    "components": ["unet", "scheduler", "vae"],
+                    "_class_name": "CondLatentDiffusionPipeline",
+                    "_diffusers_version": diffusers.__version__
+                }
+                with open(os.path.join(args.output_dir, "model_index.json"), "w") as f:
+                    json.dump(model_index, f)
                 
                 # 恢复原始权重
                 if args.use_ema:
@@ -787,15 +819,34 @@ def main():
         # 获取unwrapped模型
         unet = accelerator.unwrap_model(unet)
         
-        # 保存条件UNet模型
-        pipeline = CondLatentDiffusionPipeline(
-            vae=vae,
-            unet=unet,
-            scheduler=scheduler,
-        )
+        # 保存条件UNet模型 - 修改为分别保存组件
+        logger.info(f"保存最终模型到 {args.output_dir}")
         
-        # 保存pipeline
-        pipeline.save_pretrained(args.output_dir)
+        # 清理旧的模型文件
+        model_files = ["model_index.json", "scheduler", "unet", "vae"]
+        for file_or_dir in model_files:
+            path = os.path.join(args.output_dir, file_or_dir)
+            if os.path.isdir(path):
+                logger.info(f"删除目录: {file_or_dir}")
+                shutil.rmtree(path, ignore_errors=True)
+            elif os.path.isfile(path):
+                logger.info(f"删除文件: {file_or_dir}")
+                os.remove(path)
+        
+        # 分别保存各组件
+        unet.save_pretrained(os.path.join(args.output_dir, "unet"))
+        scheduler.save_pretrained(os.path.join(args.output_dir, "scheduler"))
+        vae.save_pretrained(os.path.join(args.output_dir, "vae"))
+        
+        # 创建model_index.json
+        import json
+        model_index = {
+            "components": ["unet", "scheduler", "vae"],
+            "_class_name": "CondLatentDiffusionPipeline",
+            "_diffusers_version": diffusers.__version__
+        }
+        with open(os.path.join(args.output_dir, "model_index.json"), "w") as f:
+            json.dump(model_index, f)
         
         # 恢复原始权重
         if args.use_ema:
