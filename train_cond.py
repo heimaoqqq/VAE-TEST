@@ -522,12 +522,26 @@ def main():
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
     
-    # 设置进度条
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
-    progress_bar.set_description("训练步骤")
+    # 权重数据类型
+    weight_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        weight_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        weight_dtype = torch.bfloat16
+        
+    # 将VAE移动到设备上并设置为评估模式
+    vae.to(accelerator.device, dtype=weight_dtype)
+    vae.eval()
+    
+    # 计算每个轮次的更新步数
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    
+    # 设置进度条 - 使用轮次而非总步数
+    progress_bar = tqdm(range(args.num_train_epochs), disable=not accelerator.is_local_main_process)
+    progress_bar.set_description("训练轮次")
     
     global_step = 0
-          
+    
     # 从检查点恢复训练
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
@@ -548,24 +562,26 @@ def main():
             accelerator.load_state(path)
             global_step = int(path.split("-")[1])
             
-            # 调整进度条
-            resume_global_step = global_step * args.gradient_accumulation_steps
-            progress_bar.update(resume_global_step)
-    
-    # 权重数据类型
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-        
-    # 将VAE移动到设备上并设置为评估模式
-    vae.to(accelerator.device, dtype=weight_dtype)
-    vae.eval()
+            # 计算对应的轮次和步骤
+            resume_epoch = global_step // num_update_steps_per_epoch
+            resume_step = global_step % num_update_steps_per_epoch
+            
+            # 更新进度条
+            progress_bar.update(resume_epoch)
+            progress_bar.set_description(f"从轮次 {resume_epoch} 恢复训练")
+            
+            logger.info(f"从步骤 {global_step} (轮次 {resume_epoch}, 步骤 {resume_step}) 恢复训练")
     
     # 训练循环
     for epoch in range(args.num_train_epochs):
         unet.train()
+        # 为每个轮次创建一个内部进度条
+        epoch_progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
+        epoch_progress_bar.set_description(f"轮次 {epoch+1}/{args.num_train_epochs}")
+        
+        # 记录每个轮次的平均损失
+        epoch_loss = 0.0
+        
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
                 # 转换为潜在表示
@@ -613,13 +629,15 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad()
                 
+                # 累积损失
+                epoch_loss += loss.detach().item()
+                
             # 更新EMA模型
             if args.use_ema and accelerator.sync_gradients:
                 ema_model.step(unet.parameters())
                 
-            # 更新进度条
+            # 更新步数
             if accelerator.sync_gradients:
-                progress_bar.update(1)
                 global_step += 1
                 
                 # 保存检查点
@@ -641,86 +659,100 @@ def main():
                                     shutil.rmtree(old_ckpt_path)
                                     logger.info(f"删除旧检查点{old_ckpt_path}")
                 
-                # 生成示例图像
-                if accelerator.is_main_process:
-                    if global_step % (args.save_images_epochs * len(train_dataloader)) == 0 or global_step == args.max_train_steps:
-                        # 使用EMA模型或当前模型
-                        if args.use_ema:
-                            ema_model.store(unet.parameters())
-                            ema_model.copy_to(unet.parameters())
-                        
-                        # 创建评估pipeline
-                        pipeline = CondLatentDiffusionPipeline(
-                            vae=vae,
-                            unet=unet,
-                            scheduler=scheduler,
-                        )
-                        
-                        # 为每个用户ID生成样本（从0到4）
-                        for eval_user_id in range(5):
-                            # 创建用户ID张量
-                            eval_user_ids = torch.tensor([eval_user_id] * args.eval_batch_size, device=accelerator.device)
-                            
-                            # 设置随机种子
-                            generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
-                            
-                            # 生成样本
-                            images = pipeline(
-                                batch_size=args.eval_batch_size,
-                                user_ids=eval_user_ids,
-                                num_inference_steps=args.ddpm_num_inference_steps,
-                                generator=generator,
-                                output_type="numpy",
-                                guidance_scale=3.0,  # 使用条件引导
-                            ).images
-                            
-                            # 保存图像
-                            images_processed = (images * 255).round().astype("uint8")
-                            for i, image in enumerate(images_processed):
-                                image_pil = transforms.ToPILImage()(image.transpose(2, 0, 1)/255.0)
-                                image_pil.save(
-                                    os.path.join(
-                                        args.output_dir, 
-                                        f"epoch_{epoch}_step_{global_step}_user_{eval_user_id}_sample_{i}.png"
-                                    )
-                                )
-                        
-                        # 恢复原始权重
-                        if args.use_ema:
-                            ema_model.restore(unet.parameters())
-                
-                # 保存模型
-                if accelerator.is_main_process:
-                    if global_step % (args.save_model_epochs * len(train_dataloader)) == 0 or global_step == args.max_train_steps:
-                        # 使用EMA模型或当前模型
-                        if args.use_ema:
-                            ema_model.store(unet.parameters())
-                            ema_model.copy_to(unet.parameters())
-                            
-                        # 获取unwrapped模型
-                        unet_unwrapped = accelerator.unwrap_model(unet)
-                        
-                        # 保存条件UNet模型
-                        base_unet_unwrapped = unet_unwrapped.unet
-                        
-                        # 保存模型组件
-                        pipeline = CondLatentDiffusionPipeline(
-                            vae=vae,
-                            unet=unet_unwrapped,
-                            scheduler=scheduler,
-                        )
-                        
-                        # 保存pipeline
-                        pipeline.save_pretrained(args.output_dir)
-                        
-                        # 恢复原始权重
-                        if args.use_ema:
-                            ema_model.restore(unet.parameters())
-            
-            # 检查是否完成训练
-            if global_step >= args.max_train_steps:
-                break
+            # 更新内部进度条，显示当前步骤和损失
+            epoch_progress_bar.update(1)
+            epoch_progress_bar.set_postfix(loss=loss.detach().item(), lr=lr_scheduler.get_last_lr()[0])
         
+        # 计算平均损失
+        avg_loss = epoch_loss / len(train_dataloader)
+        
+        # 关闭内部进度条
+        epoch_progress_bar.close()
+        
+        # 更新外部进度条，显示平均损失
+        progress_bar.update(1)
+        progress_bar.set_postfix(avg_loss=avg_loss)
+        
+        # 生成示例图像
+        if accelerator.is_main_process:
+            if epoch % args.save_images_epochs == 0 or epoch == args.num_train_epochs - 1:
+                # 使用EMA模型或当前模型
+                if args.use_ema:
+                    ema_model.store(unet.parameters())
+                    ema_model.copy_to(unet.parameters())
+                
+                # 创建评估pipeline
+                pipeline = CondLatentDiffusionPipeline(
+                    vae=vae,
+                    unet=unet,
+                    scheduler=scheduler,
+                )
+                
+                # 为每个用户ID生成样本（从0到4）
+                for eval_user_id in range(5):
+                    # 创建用户ID张量
+                    eval_user_ids = torch.tensor([eval_user_id] * args.eval_batch_size, device=accelerator.device)
+                    
+                    # 设置随机种子
+                    generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)
+                    
+                    # 生成样本
+                    images = pipeline(
+                        batch_size=args.eval_batch_size,
+                        user_ids=eval_user_ids,
+                        num_inference_steps=args.ddpm_num_inference_steps,
+                        generator=generator,
+                        output_type="numpy",
+                        guidance_scale=3.0,  # 使用条件引导
+                    ).images
+                    
+                    # 保存图像
+                    images_processed = (images * 255).round().astype("uint8")
+                    for i, image in enumerate(images_processed):
+                        image_pil = transforms.ToPILImage()(image.transpose(2, 0, 1)/255.0)
+                        image_pil.save(
+                            os.path.join(
+                                args.output_dir, 
+                                f"epoch_{epoch}_step_{global_step}_user_{eval_user_id}_sample_{i}.png"
+                            )
+                        )
+                
+                # 恢复原始权重
+                if args.use_ema:
+                    ema_model.restore(unet.parameters())
+        
+        # 保存模型
+        if accelerator.is_main_process:
+            if epoch % args.save_model_epochs == 0 or epoch == args.num_train_epochs - 1:
+                # 使用EMA模型或当前模型
+                if args.use_ema:
+                    ema_model.store(unet.parameters())
+                    ema_model.copy_to(unet.parameters())
+                    
+                # 获取unwrapped模型
+                unet_unwrapped = accelerator.unwrap_model(unet)
+                
+                # 保存条件UNet模型
+                base_unet_unwrapped = unet_unwrapped.unet
+                
+                # 保存模型组件
+                pipeline = CondLatentDiffusionPipeline(
+                    vae=vae,
+                    unet=unet_unwrapped,
+                    scheduler=scheduler,
+                )
+                
+                # 保存pipeline
+                pipeline.save_pretrained(args.output_dir)
+                
+                # 恢复原始权重
+                if args.use_ema:
+                    ema_model.restore(unet.parameters())
+        
+        # 检查是否完成训练
+        if global_step >= args.max_train_steps:
+            break
+    
     # 保存最终模型
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
