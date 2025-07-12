@@ -707,15 +707,6 @@ def main():
                 # 使用accelerator记录日志
                 accelerator.log(logs, step=global_step)
                 
-                # 在控制台输出日志
-                if accelerator.is_main_process and global_step % 10 == 0:
-                    logger.info(
-                        f"步骤 {global_step}: "
-                        f"损失: {logs['loss']:.4f}, "
-                        f"学习率: {logs['lr']:.6f}, "
-                        f"轮次: {logs['epoch']}"
-                    )
-                
                 # 更新进度条
                 epoch_progress_bar.update(1)
                 epoch_progress_bar.set_postfix(**logs)
