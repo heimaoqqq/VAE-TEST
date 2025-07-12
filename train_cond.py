@@ -279,10 +279,11 @@ class MicroDopplerDataset(torch.utils.data.Dataset):
         self.image_paths = []
         self.user_ids = []
         
-        for user_id in range(31):  # 假设有31位用户
-            user_dir = self.data_dir / f"user_{user_id}"
+        # 适应ID_1到ID_31的文件夹结构
+        for folder_id in range(1, 32):  # 从1到31
+            user_dir = self.data_dir / f"ID_{folder_id}"
             if not user_dir.exists():
-                print(f"警告: 用户{user_id}目录不存在 {user_dir}")
+                print(f"警告: 文件夹ID_{folder_id}不存在 {user_dir}")
                 continue
                 
             # 获取该用户的所有图像文件
@@ -291,16 +292,24 @@ class MicroDopplerDataset(torch.utils.data.Dataset):
                 user_images = list(user_dir.glob("*.jpg"))
             
             if not user_images:
-                print(f"警告: 用户{user_id}没有图像文件")
+                print(f"警告: 文件夹ID_{folder_id}没有图像文件")
                 continue
                 
             self.image_paths.extend(user_images)
-            self.user_ids.extend([user_id] * len(user_images))
+            
+            # 用户ID从0开始，文件夹从1开始，所以要减1进行映射
+            model_user_id = folder_id - 1
+            self.user_ids.extend([model_user_id] * len(user_images))
             
         if not self.image_paths:
             raise RuntimeError(f"在{data_dir}中找不到任何图像")
             
         print(f"加载了{len(self.image_paths)}张图像，来自{len(set(self.user_ids))}个用户")
+        for folder_id in range(1, 32):
+            model_user_id = folder_id - 1
+            count = self.user_ids.count(model_user_id)
+            if count > 0:
+                print(f"  - ID_{folder_id} (内部ID: {model_user_id}) 有 {count} 张图像")
         
     def __len__(self):
         return len(self.image_paths)
