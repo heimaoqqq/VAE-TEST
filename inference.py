@@ -24,8 +24,6 @@ parser.add_argument('--output_dir', type=str, default="generated_images",
                     help='输出目录')
 parser.add_argument('--seed', type=int, default=42,
                     help='随机种子')
-parser.add_argument('--validate_conditions', action='store_true',
-                    help='开启条件验证模式，为多个用户ID生成相同种子的图像以比较效果')
 args = parser.parse_args()
 
 # 检测可用GPU
@@ -62,12 +60,15 @@ try:
     # 手动加载各个组件并检查不同可能的路径
     from diffusers import DDPMScheduler, VQModel
     
+    # 使用fp16加载模型以加速并减少显存占用
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
     print("加载VAE模型...")
-    vae = VQModel.from_pretrained(os.path.join(model_id, "vae"))
+    vae = VQModel.from_pretrained(os.path.join(model_id, "vae"), torch_dtype=torch_dtype)
     
     print("加载条件UNet模型...")
     # 直接使用UNet2DModel的from_pretrained方法加载整个UNet
-    unet = UNet2DModel.from_pretrained(os.path.join(model_id, "unet"))
+    unet = UNet2DModel.from_pretrained(os.path.join(model_id, "unet"), torch_dtype=torch_dtype)
     
     # 创建条件Pipeline
     print("创建条件Pipeline...")
@@ -101,11 +102,11 @@ if gpu_count > 1:
         
         # 为第二个GPU加载条件UNet
         print("为第二个GPU加载条件UNet模型...")
-        unet2 = UNet2DModel.from_pretrained(os.path.join(model_id, "unet"))
+        unet2 = UNet2DModel.from_pretrained(os.path.join(model_id, "unet"), torch_dtype=torch_dtype)
         
         print("为第二个GPU创建Pipeline...")
         pipeline2 = CondLatentDiffusionPipeline(
-            vae=VQModel.from_pretrained(os.path.join(model_id, "vae")),  # 创建新的VAE实例
+            vae=VQModel.from_pretrained(os.path.join(model_id, "vae"), torch_dtype=torch_dtype),  # 创建新的VAE实例
             scheduler=DDPMScheduler.from_pretrained(os.path.join(model_id, "scheduler")),  # 创建新的调度器实例
             unet=unet2
         )
@@ -157,13 +158,14 @@ def generate_on_gpu(pipeline, batch_size, num_steps, user_id, generator, guidanc
     # 创建用户ID张量
     user_ids = torch.tensor([user_id] * batch_size, device=f"cuda:{device_idx}")
     
-    images = pipeline(
-        batch_size=batch_size,
-        num_inference_steps=num_steps,
-        generator=generator,
-        user_ids=user_ids,
-        guidance_scale=guidance_scale  # 添加条件引导强度
-    ).images
+    with torch.autocast("cuda"):
+        images = pipeline(
+            batch_size=batch_size,
+            num_inference_steps=num_steps,
+            generator=generator,
+            user_ids=user_ids,
+            guidance_scale=guidance_scale  # 添加条件引导强度
+        ).images
     generation_time = time.time() - start_time
     print(f"GPU {device_idx} 完成！耗时 {generation_time:.2f} 秒")
     results[device_idx] = images
@@ -200,13 +202,14 @@ else:
     # 创建用户ID张量
     user_ids = torch.tensor([model_user_id] * batch_size, device=device)
     
-    images = pipeline(
-        batch_size=batch_size,
-        num_inference_steps=num_inference_steps,
-        generator=generator1,
-        user_ids=user_ids,
-        guidance_scale=guidance_scale  # 添加条件引导强度
-    ).images
+    with torch.autocast("cuda"):
+        images = pipeline(
+            batch_size=batch_size,
+            num_inference_steps=num_inference_steps,
+            generator=generator1,
+            user_ids=user_ids,
+            guidance_scale=guidance_scale  # 添加条件引导强度
+        ).images
 
 generation_time = time.time() - start_time
 print(f"图像生成完成！总耗时 {generation_time:.2f} 秒，平均每张 {generation_time/batch_size:.2f} 秒")
@@ -250,49 +253,3 @@ if use_dual_pipeline:
     print(f"总生成时间: {generation_time:.2f}秒")
     print(f"平均每张图像时间: {generation_time/batch_size:.2f}秒")
     print(f"每GPU每秒生成图像数: {batch_size / generation_time / 2:.2f}")
-
-# 条件验证模式：为多个用户ID生成相同种子的图像
-if args.validate_conditions:
-    print("\n开始条件验证模式：为多个用户ID生成相同种子的图像以比较效果...")
-    
-    # 选择一些用户ID进行比较（比如1、5、10、15、20）
-    compare_user_ids = [1, 5, 10, 15, 20]
-    compare_output_dir = os.path.join(output_dir, "condition_comparison")
-    os.makedirs(compare_output_dir, exist_ok=True)
-    
-    # 使用较小的批次大小和更少的步数以加快验证过程
-    validation_batch_size = 4
-    validation_steps = min(args.steps, 500)
-    
-    # 使用固定种子，确保可比性
-    validation_seed = 1234
-    validation_generator = torch.Generator(device=device).manual_seed(validation_seed)
-    
-    # 创建比较网格的图像列表
-    comparison_images = []
-    
-    for user_id in compare_user_ids:
-        print(f"\n生成用户ID_{user_id}的验证图像...")
-        model_user_id = user_id - 1  # 转换为模型内部ID
-        user_ids = torch.tensor([model_user_id] * validation_batch_size, device=device)
-        
-        # 生成图像
-        images = pipeline(
-            batch_size=validation_batch_size,
-            num_inference_steps=validation_steps,
-            generator=validation_generator,
-            user_ids=user_ids,
-            guidance_scale=args.guidance_scale
-        ).images
-        
-        # 保存第一张图像用于比较
-        if images:
-            comparison_images.append(images[0])
-            images[0].save(os.path.join(compare_output_dir, f"ID_{user_id}_comparison.png"))
-    
-    # 创建比较网格
-    if len(comparison_images) > 1:
-        comparison_grid = create_image_grid(comparison_images, 1, len(comparison_images))
-        comparison_grid.save(os.path.join(compare_output_dir, f"user_id_comparison_grid.png"))
-        print(f"\n创建用户ID比较网格图像: {os.path.join(compare_output_dir, 'user_id_comparison_grid.png')}")
-        print("请查看比较图像以评估条件控制效果")
