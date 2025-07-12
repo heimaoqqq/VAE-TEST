@@ -84,6 +84,39 @@ class CondUNet2DModel(nn.Module):
             "user_embed_dim": user_embed_dim,
             "freeze_unet": freeze_unet
         }
+    
+    @property
+    def dtype(self):
+        """返回模型的数据类型"""
+        # 尝试从unet获取dtype
+        if hasattr(self.unet, 'dtype'):
+            return self.unet.dtype
+        # 否则从参数获取
+        for param in self.parameters():
+            return param.dtype
+        # 默认返回float32
+        return torch.float32
+    
+    @property
+    def device(self):
+        """返回模型的设备"""
+        # 尝试从unet获取device
+        if hasattr(self.unet, 'device'):
+            return self.unet.device
+        # 否则从参数获取
+        for param in self.parameters():
+            return param.device
+        # 默认返回cpu
+        return torch.device("cpu")
+    
+    def to(self, *args, **kwargs):
+        """重写to方法确保所有子模块正确迁移到目标设备/数据类型"""
+        self.unet = self.unet.to(*args, **kwargs)
+        self.user_embedding = self.user_embedding.to(*args, **kwargs)
+        self.down_film_layers = self.down_film_layers.to(*args, **kwargs)
+        self.mid_film_layer = self.mid_film_layer.to(*args, **kwargs)
+        self.up_film_layers = self.up_film_layers.to(*args, **kwargs)
+        return super().to(*args, **kwargs)
         
     def save_pretrained(self, save_directory):
         """
