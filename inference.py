@@ -58,30 +58,13 @@ try:
     print(f"正在从 {model_id} 加载模型组件...")
     start_time = time.time()
     
-    # 先加载无条件模型以获取基本组件
-    from src.pipeline import UncondLatentDiffusionPipeline
-    temp_pipeline = UncondLatentDiffusionPipeline.from_pretrained(model_id)
+    # 直接加载条件模型，而不是先加载无条件模型
+    pipeline = CondLatentDiffusionPipeline.from_pretrained(model_id).to(device)
     
-    # 提取组件
-    vae = temp_pipeline.vae
-    scheduler = temp_pipeline.scheduler
-    base_unet = temp_pipeline.unet
-    
-    # 释放临时pipeline
-    del temp_pipeline
-    torch.cuda.empty_cache()
-    
-    # 创建条件UNet
-    print("创建条件UNet模型...")
-    cond_unet = CondUNet2DModel(base_unet=base_unet, num_users=31, user_embed_dim=64)
-    
-    # 创建条件Pipeline
-    print("创建条件Pipeline...")
-    pipeline = CondLatentDiffusionPipeline(
-        vae=vae,
-        scheduler=scheduler,
-        unet=cond_unet
-    ).to(device)
+    # 获取组件以便后续可能的双GPU使用
+    vae = pipeline.vae
+    scheduler = pipeline.scheduler
+    cond_unet = pipeline.unet
     
     load_time = time.time() - start_time
     print(f"模型加载成功！耗时 {load_time:.2f} 秒")
@@ -96,17 +79,10 @@ if gpu_count > 1:
         # 尝试创建第二个模型实例到第二个GPU
         print(f"正在为第二个GPU加载模型...")
         second_device = f"cuda:1"
-        # 为第二个GPU创建条件UNet
-        cond_unet2 = CondUNet2DModel(
-            base_unet=UNet2DModel.from_pretrained(model_id, subfolder="unet"),  # 重新加载基础UNet
-            num_users=31, 
-            user_embed_dim=64
-        )
-        pipeline2 = CondLatentDiffusionPipeline(
-            vae=vae.to(second_device),  # 重用VAE但移动到第二个GPU
-            scheduler=scheduler,  # 调度器不需要移动到GPU
-            unet=cond_unet2.to(second_device)
-        )
+        
+        # 直接加载第二个条件模型到第二个GPU
+        pipeline2 = CondLatentDiffusionPipeline.from_pretrained(model_id).to(second_device)
+        
         print(f"第二个模型实例加载成功！")
         use_dual_pipeline = True
     except Exception as e:
