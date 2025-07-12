@@ -95,7 +95,22 @@ class CondUNet2DModel(nn.Module):
         # 首先获取用户嵌入向量
         user_embed = None
         if user_ids is not None:
-            user_embed = self.user_embedding(user_ids)  # [batch_size, user_embed_dim]
+            # 过滤出有效的用户ID (>=0)，-1表示无条件生成
+            valid_mask = user_ids >= 0
+            if valid_mask.any():
+                # 只为有效ID创建嵌入
+                valid_ids = user_ids[valid_mask]
+                valid_embeds = self.user_embedding(valid_ids)  # [valid_count, user_embed_dim]
+                
+                # 创建全零嵌入向量
+                user_embed = torch.zeros(
+                    (user_ids.shape[0], self.user_embedding.embedding_dim), 
+                    device=user_ids.device, 
+                    dtype=valid_embeds.dtype
+                )
+                
+                # 将有效嵌入放回对应位置
+                user_embed[valid_mask] = valid_embeds
             
         # 使用原始UNet的时间嵌入部分
         timesteps = timestep
