@@ -44,8 +44,8 @@ def parse_args():
         "--pretrained_model_path",
         type=str,
         default=None,
-        required=True,
-        help="预训练模型的路径，训练好的无条件模型",
+        required=False,  # 修改为可选参数
+        help="预训练模型的路径，如不提供则从头训练",
     )
     parser.add_argument(
         "--dataset_path",
@@ -359,21 +359,66 @@ def main():
     # 处理输出目录
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
+    
+    # 准备模型组件
+    logger.info(f"准备模型组件")
+    
+    # 检查是从头开始训练还是基于预训练模型
+    if args.pretrained_model_path and os.path.exists(args.pretrained_model_path):
+        logger.info(f"从预训练模型加载组件: {args.pretrained_model_path}")
+        # 加载预训练的无条件模型组件
+        from src.pipeline import UncondLatentDiffusionPipeline
+        temp_pipeline = UncondLatentDiffusionPipeline.from_pretrained(args.pretrained_model_path)
         
-    # 加载预训练模型
-    logger.info(f"加载预训练模型组件: {args.pretrained_model_path}")
-    
-    # 先加载无条件模型获取基本组件
-    from src.pipeline import UncondLatentDiffusionPipeline
-    temp_pipeline = UncondLatentDiffusionPipeline.from_pretrained(args.pretrained_model_path)
-    
-    # 提取组件
-    vae = temp_pipeline.vae
-    scheduler = temp_pipeline.scheduler
-    base_unet = temp_pipeline.unet
-    
-    # 释放临时pipeline
-    del temp_pipeline
+        # 提取组件
+        vae = temp_pipeline.vae
+        scheduler = temp_pipeline.scheduler
+        base_unet = temp_pipeline.unet
+        
+        # 释放临时pipeline
+        del temp_pipeline
+    else:
+        logger.info("从头初始化模型组件")
+        # 创建新的VAE模型
+        vae = VQModel(
+            in_channels=3,
+            out_channels=3,
+            down_block_types=["DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"],
+            up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"],
+            block_out_channels=[128, 256, 512],
+            latent_channels=3,
+            sample_size=args.resolution // 8,  # VAE的输出分辨率
+        )
+        
+        # 创建UNet模型
+        base_unet = UNet2DModel(
+            sample_size=args.resolution // 8,  # 与VAE的latent空间大小匹配
+            in_channels=3,
+            out_channels=3,
+            layers_per_block=2,
+            block_out_channels=(128, 256, 512, 512),
+            down_block_types=(
+                "DownBlock2D",
+                "DownBlock2D",
+                "AttnDownBlock2D",
+                "DownBlock2D",
+            ),
+            up_block_types=(
+                "UpBlock2D",
+                "AttnUpBlock2D",
+                "UpBlock2D",
+                "UpBlock2D",
+            ),
+        )
+        
+        # 创建调度器
+        scheduler = DDPMScheduler(
+            num_train_timesteps=1000,
+            beta_start=0.0001,
+            beta_end=0.02,
+            beta_schedule="linear",
+            clip_sample=False,
+        )
     
     # 创建条件UNet
     logger.info(f"创建条件UNet模型，用户嵌入维度: {args.user_embed_dim}")
