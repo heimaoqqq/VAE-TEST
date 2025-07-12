@@ -287,8 +287,19 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
                 raise ValueError(f"user_ids长度({len(user_ids)})与batch_size({batch_size})不一致")
                 
         # 设置图像大小
-        height = height or unet_config.sample_size * self.vae_scale_factor
-        width = width or unet_config.sample_size * self.vae_scale_factor
+        if unet_config is not None:
+            if isinstance(unet_config, dict):
+                # 如果是字典，直接访问键值
+                sample_size = unet_config.get("sample_size", 32)
+            else:
+                # 如果是对象，使用属性访问
+                sample_size = getattr(unet_config, "sample_size", 32)
+            height = height or sample_size * self.vae_scale_factor
+            width = width or sample_size * self.vae_scale_factor
+        else:
+            # 默认值
+            height = height or 256
+            width = width or 256
 
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(
