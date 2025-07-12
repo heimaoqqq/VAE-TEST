@@ -580,7 +580,8 @@ def main():
     progress_bar = tqdm(range(args.num_train_epochs), 
                         disable=not accelerator.is_local_main_process,
                         dynamic_ncols=True,  # 动态调整宽度
-                        leave=True)  # 保留进度条
+                        leave=True,        # 保留进度条
+                        position=0)       # 固定位置
     progress_bar.set_description("训练轮次")
     
     global_step = 0
@@ -597,10 +598,12 @@ def main():
             path = dirs[-1] if len(dirs) > 0 else None
             
         if path is None:
-            accelerator.print(f"检查点'{args.resume_from_checkpoint}'未找到，从头开始训练")
+            if accelerator.is_local_main_process:
+                progress_bar.write(f"检查点'{args.resume_from_checkpoint}'未找到，从头开始训练")
             args.resume_from_checkpoint = None
         else:
-            accelerator.print(f"从检查点'{path}'恢复训练")
+            if accelerator.is_local_main_process:
+                progress_bar.write(f"从检查点'{path}'恢复训练")
             path = os.path.join(args.output_dir, path)
             accelerator.load_state(path)
             global_step = int(path.split("-")[1])
@@ -611,7 +614,8 @@ def main():
             
             # 更新进度条
             progress_bar.update(resume_epoch)
-            progress_bar.set_description(f"从轮次 {resume_epoch} 恢复训练")
+            if accelerator.is_local_main_process:
+                progress_bar.set_description(f"从轮次 {resume_epoch} 恢复训练")
             
             # logger.info(f"从步骤 {global_step} (轮次 {resume_epoch}, 步骤 {resume_step}) 恢复训练")
     
@@ -635,7 +639,11 @@ def main():
     for epoch in range(args.num_train_epochs):
         unet.train()
         # 为每个轮次创建一个内部进度条
-        epoch_progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process)
+        epoch_progress_bar = tqdm(total=num_update_steps_per_epoch, 
+                                  disable=not accelerator.is_local_main_process,
+                                  dynamic_ncols=True,  # 动态调整宽度
+                                  leave=False,         # 不保留旧的进度条
+                                  position=1)          # 设置在主进度条下方
         epoch_progress_bar.set_description(f"轮次 {epoch+1}/{args.num_train_epochs}")
         
         # 记录每个轮次的平均损失
@@ -701,18 +709,14 @@ def main():
             if accelerator.sync_gradients:
                 global_step += 1
                 
-                # 记录详细的日志信息
+                # 记录详细的日志信息，但减少内容
                 logs = {
-                    "loss": loss.detach().item(),
-                    "lr": lr_scheduler.get_last_lr()[0],
-                    "step": global_step,
-                    "epoch": epoch
+                    "loss": f"{loss.detach().item():.4f}",
+                    "lr": f"{lr_scheduler.get_last_lr()[0]:.6f}"
                 }
-                if args.use_ema:
-                    logs["ema_decay"] = ema_model.cur_decay_value
                 
-                # 使用accelerator记录日志
-                accelerator.log(logs, step=global_step)
+                # 使用accelerator记录日志，不会打断进度条
+                accelerator.log({"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
                 
                 # 更新进度条
                 epoch_progress_bar.update(1)
@@ -734,8 +738,8 @@ def main():
                             sys.stdout.close()
                             sys.stdout = original_stdout
                             
-                        # 使用进度条而非日志记录检查点信息
-                        epoch_progress_bar.write(f"保存检查点到 {save_path}")
+                        # 使用进度条的write方法输出信息，不会打断进度条
+                        progress_bar.write(f"保存检查点到 {save_path}")
                         
                         # 删除旧检查点
                         if args.checkpoints_total_limit is not None:
@@ -747,18 +751,16 @@ def main():
                                 for old_ckpt in checkpoints[:num_to_remove]:
                                     old_ckpt_path = os.path.join(args.output_dir, old_ckpt)
                                     shutil.rmtree(old_ckpt_path)
-                                    epoch_progress_bar.write(f"删除旧检查点 {old_ckpt_path}")
-                
-            # 更新内部进度条，显示当前步骤和损失
-            if step % 5 == 0:  # 减少进度条更新频率
-                current_loss = loss.detach().item()
-                current_lr = lr_scheduler.get_last_lr()[0]
-                epoch_progress_bar.set_postfix(
-                    loss=f"{current_loss:.4f}",
-                    lr=f"{current_lr:.6f}"
-                )
-                # 不在这里更新进度条，而是在sync_gradients时更新
-                # epoch_progress_bar.update(min(5, num_update_steps_per_epoch - epoch_progress_bar.n))
+                                    progress_bar.write(f"删除旧检查点 {old_ckpt_path}")
+            
+            # 移除在每个步骤更新进度条的代码，避免频繁刷新
+            # if step % 5 == 0:
+            #     current_loss = loss.detach().item()
+            #     current_lr = lr_scheduler.get_last_lr()[0]
+            #     epoch_progress_bar.set_postfix(
+            #         loss=f"{current_loss:.4f}",
+            #         lr=f"{current_lr:.6f}"
+            #     )
             
         # 确保进度条完成
         # 不需要在这里更新进度条，因为我们已经在每个梯度累积步骤中更新了
