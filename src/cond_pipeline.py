@@ -20,7 +20,7 @@ from diffusers.schedulers import (
 from diffusers.utils.torch_utils import randn_tensor
 
 from src.pipeline import LatentDiffusionPipelineBase
-from src.cond_unet import CondUNet2DModel
+from diffusers import UNet2DModel
 import numpy as np
 
 
@@ -32,7 +32,6 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
             self,
             vae: VQModel,
             scheduler: Union[
-                DDIMScheduler,
                 DDPMScheduler,
                 DPMSolverMultistepScheduler,
                 EulerAncestralDiscreteScheduler,
@@ -40,7 +39,7 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
                 LMSDiscreteScheduler,
                 PNDMScheduler,
             ],
-            unet: CondUNet2DModel,
+            unet: UNet2DModel,
     ):
         super().__init__()
 
@@ -105,7 +104,7 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
         print(f"解码latents，形状: {latents.shape}, 类型: {latents.dtype}")
         
         # 缩放latents
-        latents = latents / 0.18215
+        latents = latents / self.vae.config.scaling_factor
         
         # 确保latents与vae的数据类型一致
         dtype = None
@@ -125,66 +124,26 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
         # 解码
         try:
             image = self.vae.decode(latents, return_dict=False)[0]
-            print(f"VAE解码后的图像形状: {image.shape}, 类型: {image.dtype}")
             
             # 规范化到[0, 1]范围
             image = (image / 2 + 0.5).clamp(0, 1)
             
             # 转换为numpy数组，形状为[B, H, W, C]
             image = image.cpu().permute(0, 2, 3, 1).float().numpy()
-            print(f"最终图像形状: {image.shape}, 类型: {type(image)}, 值范围: [{image.min()}, {image.max()}]")
             
             return image
         except Exception as e:
             print(f"VAE解码失败: {e}")
-            print(f"尝试替代解码方法...")
-            
-            # 尝试替代解码方法
-            try:
-                # 如果vae有decode_first_stage方法
-                if hasattr(self.vae, 'decode_first_stage'):
-                    image = self.vae.decode_first_stage(latents)
-                # 或者如果是VQModel
-                elif hasattr(self.vae, 'decode') and callable(self.vae.decode):
-                    # 尝试不同的参数组合
-                    try:
-                        image = self.vae.decode(latents).sample
-                    except:
-                        try:
-                            image = self.vae.decode(latents)[0]
-                        except:
-                            image = self.vae.decode(latents)
-                else:
-                    raise ValueError("无法找到合适的解码方法")
-                
-                print(f"替代解码后的图像形状: {image.shape}, 类型: {image.dtype}")
-                
-                # 规范化到[0, 1]范围
-                image = (image / 2 + 0.5).clamp(0, 1)
-                
-                # 转换为numpy数组，形状为[B, H, W, C]
-                if len(image.shape) == 4 and image.shape[1] in [1, 3]:  # [B, C, H, W]
-                    image = image.cpu().permute(0, 2, 3, 1).float().numpy()
-                else:
-                    # 如果形状不是预期的，尝试转换
-                    print(f"警告: 图像形状异常: {image.shape}，尝试转换")
-                    image = image.cpu().float().numpy()
-                    
-                print(f"最终图像形状: {image.shape}, 类型: {type(image)}, 值范围: [{image.min()}, {image.max()}]")
-                
-                return image
-            except Exception as e2:
-                print(f"替代解码也失败: {e2}")
-                # 创建一个空的占位图像
-                print("创建占位图像")
-                placeholder = np.zeros((latents.shape[0], 256, 256, 3), dtype=np.float32)
-                return placeholder
+            # 创建一个空的占位图像
+            print("创建占位图像")
+            placeholder = np.zeros((latents.shape[0], 256, 256, 3), dtype=np.float32)
+            return placeholder
 
     @torch.no_grad()
     def __call__(
             self,
             batch_size: int = 1,
-            user_ids: Optional[torch.Tensor] = None,
+            user_ids: Optional[torch.LongTensor] = None,
             height: Optional[int] = None,
             width: Optional[int] = None,
             num_inference_steps: Optional[int] = 50,
@@ -193,206 +152,82 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
             output_type: Optional[str] = "pil",
             return_dict: bool = True,
             eta: Optional[float] = 0.0,
-            guidance_scale: float = 1.0,  # 添加条件引导比例
+            guidance_scale: float = 7.5,
             **kwargs,
     ) -> Union[Tuple, ImagePipelineOutput]:
-        """
-        条件生成函数
         
-        Args:
-            batch_size: 批次大小
-            user_ids: 用户ID张量 [batch_size]
-            height: 输出图像高度
-            width: 输出图像宽度
-            num_inference_steps: 推理步数
-            generator: 随机数生成器
-            latents: 预定义的潜在向量
-            output_type: 输出类型 "pil"或"numpy"
-            return_dict: 是否返回字典
-            eta: DDIM采样器的eta参数
-            guidance_scale: 条件引导比例
-        """
-        # 检查GPU数量和配置
-        gpu_count = torch.cuda.device_count()
+        # 0. 获取设备和数据类型
         device = self.device
-        
-        # 安全检测模型类型，处理不同的并行包装类型
-        is_dataparallel = False
-        
-        # 检查unet是否已经是DataParallel
-        if isinstance(self.unet, nn.DataParallel) or isinstance(self.unet, nn.parallel.DistributedDataParallel):
-            is_dataparallel = True
-            print("检测到UNet已经是DataParallel模型")
-        elif hasattr(self.unet, 'unet'):
-            # 检查内部unet是否为DataParallel
-            if isinstance(self.unet.unet, nn.DataParallel) or isinstance(self.unet.unet, nn.parallel.DistributedDataParallel):
-                is_dataparallel = True
-                print("检测到内部UNet已经是DataParallel模型")
-        
-        print(f"可用GPU数量: {gpu_count}")
-        if gpu_count > 1 and not is_dataparallel:
-            print(f"使用 {gpu_count} 个GPU进行并行推理")
-            # 我们不再尝试在这里包装模型，因为我们已经在CondUNet2DModel中处理了DataParallel的情况
-        
-        # 确定正确的设备
-        unet_config = None
-        unet_dtype = None
-        
-        # 获取UNet配置的安全方法
-        def get_unet_config_safe(unet_model):
-            try:
-                # 尝试直接获取配置
-                if hasattr(unet_model, 'config'):
-                    return unet_model.config, next(unet_model.parameters()).dtype
-                # 尝试通过module获取配置
-                elif hasattr(unet_model, 'module') and hasattr(unet_model.module, 'config'):
-                    return unet_model.module.config, next(unet_model.module.parameters()).dtype
-                # 尝试通过unet属性获取配置
-                elif hasattr(unet_model, 'unet'):
-                    inner_unet = unet_model.unet
-                    if hasattr(inner_unet, 'config'):
-                        return inner_unet.config, next(inner_unet.parameters()).dtype
-                    elif hasattr(inner_unet, 'module') and hasattr(inner_unet.module, 'config'):
-                        return inner_unet.module.config, next(inner_unet.module.parameters()).dtype
-                return None, torch.float32
-            except Exception as e:
-                print(f"获取UNet配置失败: {e}")
-                return None, torch.float32
-        
-        # 获取UNet配置
-        unet_config, unet_dtype = get_unet_config_safe(self.unet)
-        if unet_config is None:
-            print("警告: 无法获取UNet配置，使用默认值")
-            # 尝试使用默认的sample_size
-            if hasattr(self.unet, 'config'):
-                unet_config = self.unet.config
-            else:
-                # 创建一个简单的配置对象
-                class SimpleConfig:
-                    def __init__(self, sample_size=32):
-                        self.sample_size = sample_size
-                unet_config = SimpleConfig()
-            
-        # 处理user_ids，确保它在正确的设备上
-        if user_ids is not None:
-            if not torch.is_tensor(user_ids):
-                user_ids = torch.tensor([user_ids], device=device)
-            elif user_ids.device != device:
-                user_ids = user_ids.to(device)
-            
-            # 确保user_ids长度与batch_size一致
-            if len(user_ids) == 1 and batch_size > 1:
-                user_ids = user_ids.repeat(batch_size)
-            elif len(user_ids) != batch_size:
-                raise ValueError(f"user_ids长度({len(user_ids)})与batch_size({batch_size})不一致")
-                
-        # 设置图像大小
-        if unet_config is not None:
-            if isinstance(unet_config, dict):
-                # 如果是字典，直接访问键值
-                sample_size = unet_config.get("sample_size", 32)
-            else:
-                # 如果是对象，使用属性访问
-                sample_size = getattr(unet_config, "sample_size", 32)
-            height = height or sample_size * self.vae_scale_factor
-            width = width or sample_size * self.vae_scale_factor
-        else:
-            # 默认值
-            height = height or 256
-            width = width or 256
+        dtype = self.unet.dtype
 
-        if height % 8 != 0 or width % 8 != 0:
-            raise ValueError(
-                f"`height`和`width`必须是8的倍数，当前值为{height}和{width}。"
-            )
+        # 1. 定义调用默认值
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
 
-        # 根据GPU数量确定每个GPU的批量大小
-        if gpu_count > 1:
-            original_batch_size = batch_size
-            adjusted_batch_size = batch_size
-            if batch_size % gpu_count != 0:
-                adjusted_batch_size = ((batch_size // gpu_count) + 1) * gpu_count
-                print(f"批量大小调整为: {adjusted_batch_size} (GPU数量的倍数)")
-                if adjusted_batch_size != batch_size:
-                    batch_size = adjusted_batch_size
-                    # 如果有user_ids，也需要扩展
-                    if user_ids is not None:
-                        # 复制最后一个用户ID来填充
-                        padding = user_ids[-1].repeat(adjusted_batch_size - original_batch_size)
-                        user_ids = torch.cat([user_ids, padding])
-        else:
-            original_batch_size = batch_size
-        
-        # 准备latents
-        shape = (batch_size, 3, height // self.vae_scale_factor, width // self.vae_scale_factor)
-        if isinstance(generator, list) and len(generator) != batch_size:
-            raise ValueError(
-                f"generator列表长度({len(generator)})与batch_size({batch_size})不一致"
-            )
+        # 2. 准备时间步
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
 
-        if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=unet_dtype)
-        else:
-            if latents.shape != shape:
-                raise ValueError(
-                    f"latents形状不匹配，期望{shape}，实际{latents.shape}"
-                )
-            latents = latents.to(device)
+        # 3. 准备潜在变量
+        num_channels_latents = self.unet.config.in_channels
+        latents = self.prepare_latents(
+            batch_size,
+            num_channels_latents,
+            height,
+            width,
+            dtype,
+            device,
+            generator,
+            latents,
+        )
 
-        # scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma
-
-        # 设置时间步
-        self.scheduler.set_timesteps(num_inference_steps)
-
-        # prepare extra kwargs for the scheduler step
+        # 4. 准备额外的调度器参数
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        # 使用tqdm显示进度
-        for t in tqdm(self.scheduler.timesteps, desc="生成进度"):
-            # 确保时间步是正确的形状
-            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
+        # 5. 无分类器指导设置
+        do_classifier_free_guidance = guidance_scale > 1.0
+        if do_classifier_free_guidance:
+            if user_ids is None:
+                raise ValueError("`user_ids`不能为空，当 `guidance_scale` > 1")
             
-            # 当前latents
-            current_latents = latents
-            
-            # 对输入进行缩放
-            latents = self.scheduler.scale_model_input(current_latents, t)
-            
-            # 条件生成
-            if guidance_scale > 1.0 and user_ids is not None:
-                # 创建扩展批次（一半无条件，一半条件）
-                uncond_ids = torch.full_like(user_ids, -1)
-                
-                # 在推理时，保留原始latents用于更好的条件引导
-                # 运行无条件前向传播
-                noise_pred_uncond = self.unet(latents, t_tensor, user_ids=uncond_ids).sample
-                
-                # 运行条件前向传播
-                noise_pred_cond = self.unet(latents, t_tensor, user_ids=user_ids).sample
-                
-                # 分析两种噪声预测的差异
-                diff_magnitude = torch.norm(noise_pred_cond - noise_pred_uncond).item()
-                if t == self.scheduler.timesteps[0]:
-                    print(f"条件与无条件噪声预测差异大小: {diff_magnitude:.6f}")
-                
-                # 增强引导效果 - 使用classifier-free guidance公式
-                noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
-            else:
-                # 直接运行前向传播
-                noise_pred = self.unet(latents, t_tensor, user_ids=user_ids).sample
-            
-            # 进行去噪步骤
-            latents = self.scheduler.step(
-                noise_pred, t, current_latents, **extra_step_kwargs
-            ).prev_sample
+            # 创建无条件标签
+            uncond_ids = torch.full_like(user_ids, self.unet.config.num_class_embeds - 1)
+            class_labels = torch.cat([user_ids, uncond_ids])
+        else:
+            class_labels = user_ids
 
-        # 仅保留请求的图像数量
-        if batch_size > original_batch_size:
-            latents = latents[:original_batch_size]
-            
-        # 解码潜在表示得到图像
+        # 6. 去噪循环
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        with self.progress_bar(total=num_inference_steps) as progress_bar:
+            for i, t in enumerate(timesteps):
+                # 如果使用无分类器指导，扩展潜在变量
+                latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+
+                # 预测噪声残差
+                noise_pred = self.unet(
+                    latent_model_input,
+                    t,
+                    class_labels=class_labels,
+                    return_dict=False,
+                )[0]
+
+                # 执行指导
+                if do_classifier_free_guidance:
+                    noise_pred_cond, noise_pred_uncond = noise_pred.chunk(2)
+                    noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
+
+                # 计算上一步的样本
+                latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+
+                # 更新进度条
+                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                    progress_bar.update()
+
+        # 8. 将潜在变量解码为图像
         image = self.decode_latents(latents)
+
+        # 9. 转换为PIL Image
         if output_type == "pil":
             image = self.numpy_to_pil(image)
 
