@@ -342,15 +342,16 @@ def main():
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.INFO,
+        level=logging.WARNING,  # 将默认级别改为WARNING，减少INFO级别的输出
     )
     # 设置日志级别，减少不必要的输出
     if accelerator.is_local_main_process:
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.WARNING)  # 将INFO改为WARNING
     else:
         logger.setLevel(logging.ERROR)  # 非主进程只显示错误信息
         
-    logger.info(accelerator.state, main_process_only=True)  # 只在主进程显示
+    # 不显示accelerator状态
+    # logger.info(accelerator.state, main_process_only=True)
     
     # 设置随机种子
     if args.seed is not None:
@@ -361,11 +362,12 @@ def main():
         os.makedirs(args.output_dir, exist_ok=True)
     
     # 准备模型组件
-    logger.info(f"准备模型组件")
+    # logger.info(f"准备模型组件")
     
     # 检查是从头开始训练还是基于预训练模型
     if args.pretrained_model_path and os.path.exists(args.pretrained_model_path):
-        logger.info(f"从预训练模型加载组件: {args.pretrained_model_path}")
+        # logger.info(f"从预训练模型加载组件: {args.pretrained_model_path}")
+        logger.warning(f"从预训练模型加载组件: {args.pretrained_model_path}")
         # 加载预训练的无条件模型组件
         from src.pipeline import UncondLatentDiffusionPipeline
         temp_pipeline = UncondLatentDiffusionPipeline.from_pretrained(args.pretrained_model_path)
@@ -378,7 +380,8 @@ def main():
         # 释放临时pipeline
         del temp_pipeline
     else:
-        logger.info("从头初始化模型组件")
+        # logger.info("从头初始化模型组件")
+        logger.warning("从头初始化模型组件")
         # 创建新的VAE模型
         vae = VQModel(
             in_channels=3,
@@ -421,7 +424,7 @@ def main():
         )
     
     # 创建条件UNet
-    logger.info(f"创建条件UNet模型，用户嵌入维度: {args.user_embed_dim}")
+    # logger.info(f"创建条件UNet模型，用户嵌入维度: {args.user_embed_dim}")
     unet = CondUNet2DModel(
         base_unet=base_unet, 
         num_users=args.num_users, 
@@ -433,13 +436,14 @@ def main():
     try:
         # 只在PyTorch 2.0+且CUDA可用的情况下尝试使用torch.compile
         if hasattr(torch, 'compile') and torch.__version__ >= "2.0.0" and torch.cuda.is_available():
-            logger.info("检测到PyTorch 2.0+，尝试使用torch.compile优化模型")
+            # logger.info("检测到PyTorch 2.0+，尝试使用torch.compile优化模型")
             # 使用最安全的模式，或者完全禁用
             # unet = torch.compile(unet, mode="reduce-overhead")
-            logger.info("由于索引操作兼容性问题，跳过torch.compile优化")
+            # logger.info("由于索引操作兼容性问题，跳过torch.compile优化")
             # 不应用torch.compile，以避免索引操作的问题
     except Exception as e:
-        logger.warning(f"torch.compile优化失败: {e}，跳过优化")
+        # logger.warning(f"torch.compile优化失败: {e}，跳过优化")
+        pass
     
     # 设置调度器
     noise_scheduler = scheduler
@@ -458,11 +462,11 @@ def main():
         num_cpus = multiprocessing.cpu_count()
         # 使用保守的设置
         num_workers = 2  # 固定使用2个工作进程，避免过多worker导致问题
-        logger.info(f"数据加载器使用 {num_workers} 个工作进程")
+        # logger.info(f"数据加载器使用 {num_workers} 个工作进程")
     except Exception as e:
         # 如果无法确定CPU数量，使用默认值
         num_workers = 0
-        logger.warning(f"无法确定CPU数量: {e}，不使用额外的工作进程")
+        # logger.warning(f"无法确定CPU数量: {e}，不使用额外的工作进程")
     
     # 创建数据加载器
     train_dataloader = torch.utils.data.DataLoader(
@@ -475,10 +479,10 @@ def main():
     # 计算训练步数 - 在创建优化器和学习率调度器之前
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * len(train_dataloader)
-        logger.info(f"设置总训练步数为: {args.max_train_steps}")
+        # logger.info(f"设置总训练步数为: {args.max_train_steps}")
     else:
         args.num_train_epochs = math.ceil(args.max_train_steps / len(train_dataloader))
-        logger.info(f"根据max_train_steps计算训练轮数: {args.num_train_epochs}")
+        # logger.info(f"根据max_train_steps计算训练轮数: {args.num_train_epochs}")
     
     # 设置优化器
     if args.use_8bit_adam:
@@ -554,18 +558,19 @@ def main():
     # 打印训练信息摘要
     if accelerator.is_main_process:
         total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-        logger.info("***** 训练信息 *****")
-        logger.info(f"  数据集大小 = {len(train_dataset)}")
-        logger.info(f"  轮次数 = {args.num_train_epochs}")
-        logger.info(f"  每个设备的批次大小 = {args.train_batch_size}")
-        logger.info(f"  总批次大小 (包括并行、分布式和梯度累积) = {total_batch_size}")
-        logger.info(f"  梯度累积步数 = {args.gradient_accumulation_steps}")
-        logger.info(f"  总训练步数 = {args.max_train_steps}")
-        logger.info(f"  混合精度 = {args.mixed_precision}")
-        logger.info(f"  用户数量 = {args.num_users}")
-        logger.info(f"  用户嵌入维度 = {args.user_embed_dim}")
-        logger.info(f"  无条件训练概率 = {args.uncond_prob}")
-        logger.info("**********************")
+        # 以下日志输出已被注释掉
+        # logger.info("***** 训练信息 *****")
+        # logger.info(f"  数据集大小 = {len(train_dataset)}")
+        # logger.info(f"  轮次数 = {args.num_train_epochs}")
+        # logger.info(f"  每个设备的批次大小 = {args.train_batch_size}")
+        # logger.info(f"  总批次大小 (包括并行、分布式和梯度累积) = {total_batch_size}")
+        # logger.info(f"  梯度累积步数 = {args.gradient_accumulation_steps}")
+        # logger.info(f"  总训练步数 = {args.max_train_steps}")
+        # logger.info(f"  混合精度 = {args.mixed_precision}")
+        # logger.info(f"  用户数量 = {args.num_users}")
+        # logger.info(f"  用户嵌入维度 = {args.user_embed_dim}")
+        # logger.info(f"  无条件训练概率 = {args.uncond_prob}")
+        # logger.info("**********************")
     
     # 计算每个轮次的更新步数
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -607,7 +612,7 @@ def main():
             progress_bar.update(resume_epoch)
             progress_bar.set_description(f"从轮次 {resume_epoch} 恢复训练")
             
-            logger.info(f"从步骤 {global_step} (轮次 {resume_epoch}, 步骤 {resume_step}) 恢复训练")
+            # logger.info(f"从步骤 {global_step} (轮次 {resume_epoch}, 步骤 {resume_step}) 恢复训练")
     
     # 启用性能分析
     torch.cuda.empty_cache()  # 清空缓存，确保有足够的GPU内存
@@ -616,13 +621,14 @@ def main():
     if torch.cuda.is_available() and accelerator.is_local_main_process:
         try:
             gpu_count = torch.cuda.device_count()
-            logger.info(f"可用GPU数量: {gpu_count}")
+            # logger.info(f"可用GPU数量: {gpu_count}")
             for i in range(gpu_count):
                 gpu_name = torch.cuda.get_device_name(i)
                 gpu_mem = torch.cuda.get_device_properties(i).total_memory / (1024**3)  # GB
-                logger.info(f"GPU {i}: {gpu_name}, 内存: {gpu_mem:.2f} GB")
+                # logger.info(f"GPU {i}: {gpu_name}, 内存: {gpu_mem:.2f} GB")
         except Exception as e:
-            logger.warning(f"无法获取GPU信息: {e}")
+            # logger.warning(f"无法获取GPU信息: {e}")
+            pass
     
     # 训练循环
     for epoch in range(args.num_train_epochs):
@@ -766,18 +772,19 @@ def main():
         # 更新外部进度条，显示平均损失
         progress_bar.set_postfix(
             avg_loss=f"{avg_loss:.4f}",
-            last_lr=f"{lr_scheduler.get_last_lr()[0]:.6f}"
+            last_lr=f"{lr_scheduler.get_last_lr()[0]:.6f}",
+            epoch=f"{epoch+1}/{args.num_train_epochs}"
         )
         progress_bar.update(1)
         
-        # 在轮次结束时输出详细的摘要信息
-        if accelerator.is_main_process:
-            logger.info(
-                f"轮次 {epoch+1}/{args.num_train_epochs} 完成: "
-                f"平均损失: {avg_loss:.4f}, "
-                f"学习率: {lr_scheduler.get_last_lr()[0]:.6f}, "
-                f"全局步数: {global_step}"
-            )
+        # 移除在轮次结束时输出详细的摘要信息
+        # if accelerator.is_main_process:
+        #     logger.info(
+        #         f"轮次 {epoch+1}/{args.num_train_epochs} 完成: "
+        #         f"平均损失: {avg_loss:.4f}, "
+        #         f"学习率: {lr_scheduler.get_last_lr()[0]:.6f}, "
+        #         f"全局步数: {global_step}"
+        #     )
         
         # 每轮结束时清理缓存
         if torch.cuda.is_available():
@@ -795,17 +802,18 @@ def main():
                 unet_unwrapped = accelerator.unwrap_model(unet)
                 
                 # 保存条件UNet模型 - 修改为分别保存组件
-                logger.info(f"保存模型到 {args.output_dir}")
+                # logger.info(f"保存模型到 {args.output_dir}")
+                progress_bar.write(f"保存模型到 {args.output_dir}")
                 
                 # 清理旧的模型文件
                 model_files = ["model_index.json", "scheduler", "unet", "vae"]
                 for file_or_dir in model_files:
                     path = os.path.join(args.output_dir, file_or_dir)
                     if os.path.isdir(path):
-                        logger.info(f"删除目录: {file_or_dir}")
+                        # logger.info(f"删除目录: {file_or_dir}")
                         shutil.rmtree(path, ignore_errors=True)
                     elif os.path.isfile(path):
-                        logger.info(f"删除文件: {file_or_dir}")
+                        # logger.info(f"删除文件: {file_or_dir}")
                         os.remove(path)
                 
                 # 分别保存各组件
@@ -842,17 +850,18 @@ def main():
         unet = accelerator.unwrap_model(unet)
         
         # 保存条件UNet模型 - 修改为分别保存组件
-        logger.info(f"保存最终模型到 {args.output_dir}")
+        # logger.info(f"保存最终模型到 {args.output_dir}")
+        progress_bar.write(f"保存最终模型到 {args.output_dir}")
         
         # 清理旧的模型文件
         model_files = ["model_index.json", "scheduler", "unet", "vae"]
         for file_or_dir in model_files:
             path = os.path.join(args.output_dir, file_or_dir)
             if os.path.isdir(path):
-                logger.info(f"删除目录: {file_or_dir}")
+                # logger.info(f"删除目录: {file_or_dir}")
                 shutil.rmtree(path, ignore_errors=True)
             elif os.path.isfile(path):
-                logger.info(f"删除文件: {file_or_dir}")
+                # logger.info(f"删除文件: {file_or_dir}")
                 os.remove(path)
         
         # 分别保存各组件
