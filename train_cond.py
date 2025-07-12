@@ -327,22 +327,13 @@ def main():
     
     # 添加优化选项
     kwargs = {}
-    if torch.__version__ >= "2.0.0":
-        # 如果PyTorch版本支持，添加更多优化选项
-        # 不再使用字符串，而是使用正确的方式或不设置该参数
-        try:
-            from accelerate.utils import DistributedDataParallelKwargs
-            ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-            kwargs["ddp_kwargs"] = ddp_kwargs
-        except ImportError:
-            logger.warning("无法导入DistributedDataParallelKwargs，跳过DDP优化")
     
+    # 使用简单的初始化方式，避免兼容性问题
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
-        **kwargs
     )
     
     # 创建日志器
@@ -437,34 +428,15 @@ def main():
     )
     
     # 如果PyTorch版本支持，使用torch.compile加速模型
-    if hasattr(torch, 'compile') and torch.__version__ >= "2.0.0":
-        logger.info("检测到PyTorch 2.0+，尝试使用torch.compile优化模型")
-        try:
-            # 检查是否在支持的平台上
-            supported = True
-            if torch.cuda.is_available():
-                # 检查CUDA版本是否支持
-                cuda_version = torch.version.cuda
-                if cuda_version is not None:
-                    major_version = int(cuda_version.split('.')[0])
-                    if major_version < 11:
-                        logger.warning(f"CUDA版本 {cuda_version} 可能不完全支持torch.compile，跳过优化")
-                        supported = False
-            
-            if supported:
-                try:
-                    # 尝试使用不同的编译模式
-                    compile_mode = "reduce-overhead"  # 更安全的模式
-                    logger.info(f"使用torch.compile优化模型，模式: {compile_mode}")
-                    unet = torch.compile(unet, mode=compile_mode)
-                except Exception as e:
-                    logger.warning(f"使用指定模式编译失败: {e}，尝试默认模式")
-                    try:
-                        unet = torch.compile(unet)
-                    except Exception as e2:
-                        logger.warning(f"torch.compile优化失败: {e2}，跳过优化")
-        except Exception as e:
-            logger.warning(f"torch.compile检查失败: {e}，跳过优化")
+    try:
+        # 只在PyTorch 2.0+且CUDA可用的情况下尝试使用torch.compile
+        if hasattr(torch, 'compile') and torch.__version__ >= "2.0.0" and torch.cuda.is_available():
+            logger.info("检测到PyTorch 2.0+，尝试使用torch.compile优化模型")
+            # 使用最安全的模式
+            unet = torch.compile(unet, mode="reduce-overhead")
+            logger.info("成功应用torch.compile优化")
+    except Exception as e:
+        logger.warning(f"torch.compile优化失败: {e}，跳过优化")
     
     # 设置调度器
     noise_scheduler = scheduler
@@ -477,38 +449,25 @@ def main():
         is_main_process=accelerator.is_main_process,
     )
     
-    # 确定最佳的num_workers数量
+    # 确定合适的num_workers数量
     try:
         import multiprocessing
         num_cpus = multiprocessing.cpu_count()
-        # 在某些环境中，使用过多的worker可能导致问题
-        # 使用更保守的设置
-        num_workers = min(4, max(1, num_cpus // 2))  # 使用一半的CPU核心，最少1个，最多4个
+        # 使用保守的设置
+        num_workers = 2  # 固定使用2个工作进程，避免过多worker导致问题
         logger.info(f"数据加载器使用 {num_workers} 个工作进程")
     except Exception as e:
         # 如果无法确定CPU数量，使用默认值
-        num_workers = 2
-        logger.warning(f"无法确定CPU数量: {e}，使用默认值 {num_workers} 个工作进程")
+        num_workers = 0
+        logger.warning(f"无法确定CPU数量: {e}，不使用额外的工作进程")
     
     # 创建数据加载器
-    try:
-        train_dataloader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=args.train_batch_size,
-            shuffle=True,
-            num_workers=num_workers,
-            pin_memory=True,  # 使用pin_memory加速数据传输
-            drop_last=True,  # 丢弃不完整的批次，避免批次大小不一致
-        )
-    except Exception as e:
-        # 如果使用高级选项失败，回退到基本设置
-        logger.warning(f"使用高级数据加载器选项失败: {e}，回退到基本设置")
-        train_dataloader = torch.utils.data.DataLoader(
-            train_dataset,
-            batch_size=args.train_batch_size,
-            shuffle=True,
-            num_workers=0,  # 不使用额外的工作进程
-        )
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+    )
     
     # 计算训练步数 - 在创建优化器和学习率调度器之前
     if args.max_train_steps is None:
