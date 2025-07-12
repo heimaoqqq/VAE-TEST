@@ -5,6 +5,8 @@ import os
 import random
 import shutil
 import warnings
+import sys
+import json
 from pathlib import Path
 
 import numpy as np
@@ -703,8 +705,6 @@ def main():
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         
                         # 临时重定向标准输出以抑制详细日志
-                        import sys
-                        import os
                         original_stdout = sys.stdout
                         sys.stdout = open(os.devnull, 'w')
                         
@@ -791,7 +791,6 @@ def main():
                 vae.save_pretrained(os.path.join(args.output_dir, "vae"))
                 
                 # 创建model_index.json
-                import json
                 model_index = {
                     "components": ["unet", "scheduler", "vae"],
                     "_class_name": "CondLatentDiffusionPipeline",
@@ -839,7 +838,6 @@ def main():
         vae.save_pretrained(os.path.join(args.output_dir, "vae"))
         
         # 创建model_index.json
-        import json
         model_index = {
             "components": ["unet", "scheduler", "vae"],
             "_class_name": "CondLatentDiffusionPipeline",
