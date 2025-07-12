@@ -93,64 +93,71 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
         """
         # 检查GPU数量和配置
         gpu_count = torch.cuda.device_count()
+        device = self.device
         
         # 安全检测模型类型，处理不同的并行包装类型
         is_dataparallel = False
-        try:
-            if hasattr(self.unet, 'unet'):
-                # 检查是否为DataParallel或DistributedDataParallel
-                is_dataparallel = isinstance(self.unet.unet, (nn.DataParallel, nn.parallel.DistributedDataParallel))
-        except AttributeError:
-            is_dataparallel = False
+        
+        # 检查unet是否已经是DataParallel
+        if isinstance(self.unet, nn.DataParallel) or isinstance(self.unet, nn.parallel.DistributedDataParallel):
+            is_dataparallel = True
+            print("检测到UNet已经是DataParallel模型")
+        elif hasattr(self.unet, 'unet'):
+            # 检查内部unet是否为DataParallel
+            if isinstance(self.unet.unet, nn.DataParallel) or isinstance(self.unet.unet, nn.parallel.DistributedDataParallel):
+                is_dataparallel = True
+                print("检测到内部UNet已经是DataParallel模型")
         
         print(f"可用GPU数量: {gpu_count}")
-        if gpu_count > 1:
+        if gpu_count > 1 and not is_dataparallel:
             print(f"使用 {gpu_count} 个GPU进行并行推理")
-            if not is_dataparallel and hasattr(self.unet, 'unet'):
-                try:
-                    print("配置DataParallel...")
-                    self.unet.unet = nn.DataParallel(self.unet.unet)  # 只并行内部的UNet
-                    is_dataparallel = True
-                except Exception as e:
-                    print(f"配置DataParallel失败: {e}")
-                    print("继续使用单GPU模式")
+            # 我们不再尝试在这里包装模型，因为我们已经在CondUNet2DModel中处理了DataParallel的情况
         
         # 确定正确的设备
         unet_config = None
         unet_dtype = None
         
-        try:
-            if hasattr(self.unet, 'unet'):
-                if is_dataparallel:
-                    if hasattr(self.unet.unet, 'module'):
-                        # DataParallel或DistributedDataParallel
-                        unet_config = self.unet.unet.module.config
-                        unet_dtype = next(self.unet.unet.module.parameters()).dtype
-                    else:
-                        # 未知的并行包装器，尝试直接访问
-                        unet_config = self.unet.unet.config
-                        unet_dtype = next(self.unet.unet.parameters()).dtype
-                else:
-                    # 常规UNet
-                    unet_config = self.unet.unet.config
-                    unet_dtype = next(self.unet.unet.parameters()).dtype
-            else:
-                # 直接是UNet模型
+        # 获取UNet配置的安全方法
+        def get_unet_config_safe(unet_model):
+            try:
+                # 尝试直接获取配置
+                if hasattr(unet_model, 'config'):
+                    return unet_model.config, next(unet_model.parameters()).dtype
+                # 尝试通过module获取配置
+                elif hasattr(unet_model, 'module') and hasattr(unet_model.module, 'config'):
+                    return unet_model.module.config, next(unet_model.module.parameters()).dtype
+                # 尝试通过unet属性获取配置
+                elif hasattr(unet_model, 'unet'):
+                    inner_unet = unet_model.unet
+                    if hasattr(inner_unet, 'config'):
+                        return inner_unet.config, next(inner_unet.parameters()).dtype
+                    elif hasattr(inner_unet, 'module') and hasattr(inner_unet.module, 'config'):
+                        return inner_unet.module.config, next(inner_unet.module.parameters()).dtype
+                return None, torch.float32
+            except Exception as e:
+                print(f"获取UNet配置失败: {e}")
+                return None, torch.float32
+        
+        # 获取UNet配置
+        unet_config, unet_dtype = get_unet_config_safe(self.unet)
+        if unet_config is None:
+            print("警告: 无法获取UNet配置，使用默认值")
+            # 尝试使用默认的sample_size
+            if hasattr(self.unet, 'config'):
                 unet_config = self.unet.config
-                unet_dtype = next(self.unet.parameters()).dtype
-        except Exception as e:
-            print(f"获取UNet配置失败: {e}")
-            print("使用默认配置")
-            # 使用默认值
-            unet_config = getattr(self.unet, 'config', None)
-            unet_dtype = torch.float32
+            else:
+                # 创建一个简单的配置对象
+                class SimpleConfig:
+                    def __init__(self, sample_size=32):
+                        self.sample_size = sample_size
+                unet_config = SimpleConfig()
             
         # 处理user_ids，确保它在正确的设备上
         if user_ids is not None:
             if not torch.is_tensor(user_ids):
-                user_ids = torch.tensor([user_ids], device=self.device)
-            elif user_ids.device != self.device:
-                user_ids = user_ids.to(self.device)
+                user_ids = torch.tensor([user_ids], device=device)
+            elif user_ids.device != device:
+                user_ids = user_ids.to(device)
             
             # 确保user_ids长度与batch_size一致
             if len(user_ids) == 1 and batch_size > 1:
@@ -192,13 +199,13 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
             )
 
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=self.device, dtype=unet_dtype)
+            latents = randn_tensor(shape, generator=generator, device=device, dtype=unet_dtype)
         else:
             if latents.shape != shape:
                 raise ValueError(
                     f"latents形状不匹配，期望{shape}，实际{latents.shape}"
                 )
-            latents = latents.to(self.device)
+            latents = latents.to(device)
 
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
@@ -212,7 +219,7 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
         # 使用tqdm显示进度
         for t in tqdm(self.scheduler.timesteps, desc="生成进度"):
             # 确保时间步是正确的形状
-            t_tensor = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
+            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
             
             # 当前latents
             current_latents = latents
@@ -223,46 +230,19 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
             # 条件生成
             if guidance_scale > 1.0 and user_ids is not None:
                 # 运行无条件前向传播 - 使用-1作为无条件标记
-                with torch.no_grad():
-                    uncond_ids = torch.full_like(user_ids, -1)
-                    # 安全调用UNet，处理各种模型包装情况
-                    try:
-                        noise_pred_uncond = self.unet(latents, t_tensor, user_ids=uncond_ids).sample
-                    except Exception as e:
-                        print(f"直接调用UNet失败: {e}")
-                        # 尝试手动解包并调用
-                        if hasattr(self.unet, 'module'):
-                            # 如果是DDP或DataParallel
-                            noise_pred_uncond = self.unet.module(latents, t_tensor, user_ids=uncond_ids).sample
-                        else:
-                            raise e  # 如果还是失败，则抛出原始错误
-                    
+                uncond_ids = torch.full_like(user_ids, -1)
+                
+                # 直接调用模型，让模型内部处理DataParallel的情况
+                noise_pred_uncond = self.unet(latents, t_tensor, user_ids=uncond_ids).sample
+                
                 # 运行条件前向传播
-                try:
-                    noise_pred_cond = self.unet(latents, t_tensor, user_ids=user_ids).sample
-                except Exception as e:
-                    print(f"直接调用UNet失败: {e}")
-                    # 尝试手动解包并调用
-                    if hasattr(self.unet, 'module'):
-                        # 如果是DDP或DataParallel
-                        noise_pred_cond = self.unet.module(latents, t_tensor, user_ids=user_ids).sample
-                    else:
-                        raise e  # 如果还是失败，则抛出原始错误
+                noise_pred_cond = self.unet(latents, t_tensor, user_ids=user_ids).sample
                 
                 # 进行引导组合
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 # 直接运行前向传播
-                try:
-                    noise_pred = self.unet(latents, t_tensor, user_ids=user_ids).sample
-                except Exception as e:
-                    print(f"直接调用UNet失败: {e}")
-                    # 尝试手动解包并调用
-                    if hasattr(self.unet, 'module'):
-                        # 如果是DDP或DataParallel
-                        noise_pred = self.unet.module(latents, t_tensor, user_ids=user_ids).sample
-                    else:
-                        raise e  # 如果还是失败，则抛出原始错误
+                noise_pred = self.unet(latents, t_tensor, user_ids=user_ids).sample
             
             # 进行去噪步骤
             latents = self.scheduler.step(
