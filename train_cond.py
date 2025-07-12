@@ -20,6 +20,7 @@ from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
+from PIL import Image
 
 import diffusers
 from diffusers import (
@@ -323,7 +324,6 @@ class MicroDopplerDataset(torch.utils.data.Dataset):
         image_path = self.image_paths[idx]
         user_id = self.user_ids[idx]
         
-        from PIL import Image
         image = Image.open(image_path).convert("RGB")
         
         if self._transform is not None:
