@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers import UNet2DModel
 from typing import List, Optional, Tuple, Union
+import os
+import json
 
 class FiLMLayer(nn.Module):
     """
@@ -75,6 +77,83 @@ class CondUNet2DModel(nn.Module):
         # 上采样块的通道数是反向的
         for ch in reversed(self.unet.config.block_out_channels):
             self.up_film_layers.append(FiLMLayer(user_embed_dim, ch))
+            
+        # 保存配置
+        self.config = {
+            "num_users": num_users,
+            "user_embed_dim": user_embed_dim,
+            "freeze_unet": freeze_unet
+        }
+        
+    def save_pretrained(self, save_directory):
+        """
+        保存模型到指定目录
+        
+        Args:
+            save_directory: 保存目录
+        """
+        os.makedirs(save_directory, exist_ok=True)
+        
+        # 保存配置
+        with open(os.path.join(save_directory, "config.json"), "w") as f:
+            json.dump(self.config, f)
+        
+        # 保存基础UNet
+        self.unet.save_pretrained(os.path.join(save_directory, "base_unet"))
+        
+        # 保存用户嵌入和FiLM层
+        state_dict = {
+            "user_embedding.weight": self.user_embedding.weight,
+        }
+        
+        # 保存下采样FiLM层
+        for i, layer in enumerate(self.down_film_layers):
+            for name, param in layer.named_parameters():
+                state_dict[f"down_film_layers.{i}.{name}"] = param
+        
+        # 保存中间FiLM层
+        for name, param in self.mid_film_layer.named_parameters():
+            state_dict[f"mid_film_layer.{name}"] = param
+        
+        # 保存上采样FiLM层
+        for i, layer in enumerate(self.up_film_layers):
+            for name, param in layer.named_parameters():
+                state_dict[f"up_film_layers.{i}.{name}"] = param
+        
+        # 保存权重
+        torch.save(state_dict, os.path.join(save_directory, "pytorch_model.bin"))
+        
+    @classmethod
+    def from_pretrained(cls, pretrained_model_path):
+        """
+        从预训练模型加载
+        
+        Args:
+            pretrained_model_path: 预训练模型路径
+        """
+        # 加载配置
+        with open(os.path.join(pretrained_model_path, "config.json"), "r") as f:
+            config = json.load(f)
+        
+        # 加载基础UNet
+        base_unet = UNet2DModel.from_pretrained(os.path.join(pretrained_model_path, "base_unet"))
+        
+        # 创建模型
+        model = cls(
+            base_unet=base_unet,
+            num_users=config["num_users"],
+            user_embed_dim=config["user_embed_dim"],
+            freeze_unet=config["freeze_unet"]
+        )
+        
+        # 加载权重
+        state_dict = torch.load(
+            os.path.join(pretrained_model_path, "pytorch_model.bin"),
+            map_location="cpu"
+        )
+        model.load_state_dict(state_dict, strict=False)
+        
+        return model
             
     def forward(
         self, 
