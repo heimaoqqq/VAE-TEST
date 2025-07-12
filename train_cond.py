@@ -447,6 +447,14 @@ def main():
         num_workers=4,
     )
     
+    # 计算训练步数 - 在创建优化器和学习率调度器之前
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * len(train_dataloader)
+        logger.info(f"设置总训练步数为: {args.max_train_steps}")
+    else:
+        args.num_train_epochs = math.ceil(args.max_train_steps / len(train_dataloader))
+        logger.info(f"根据max_train_steps计算训练轮数: {args.num_train_epochs}")
+    
     # 设置优化器
     if args.use_8bit_adam:
         try:
@@ -469,7 +477,7 @@ def main():
         eps=args.adam_epsilon,
     )
     
-    # 设置学习率调度器
+    # 设置学习率调度器 - 现在max_train_steps已经计算好了
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
@@ -507,19 +515,13 @@ def main():
     # 启用TF32精度
     if args.allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
-        
-    # 设置训练总步数
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * len(train_dataloader)
-    else:
-        args.num_train_epochs = math.ceil(args.max_train_steps / len(train_dataloader))
     
     # 设置进度条
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("训练步骤")
     
     global_step = 0
-    
+          
     # 从检查点恢复训练
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
