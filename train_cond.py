@@ -628,12 +628,7 @@ def main():
     for epoch in range(args.num_train_epochs):
         unet.train()
         # 为每个轮次创建一个内部进度条
-        epoch_progress_bar = tqdm(total=len(train_dataloader), 
-                                  disable=not accelerator.is_local_main_process,
-                                  dynamic_ncols=True,  # 动态调整宽度
-                                  leave=False,  # 不保留进度条，只显示当前轮次
-                                  position=0,   # 固定位置
-                                  mininterval=0.5)  # 减少更新频率，提高性能
+        epoch_progress_bar = tqdm(total=num_update_steps_per_epoch, disable=not accelerator.is_local_main_process)
         epoch_progress_bar.set_description(f"轮次 {epoch+1}/{args.num_train_epochs}")
         
         # 记录每个轮次的平均损失
@@ -699,6 +694,32 @@ def main():
             if accelerator.sync_gradients:
                 global_step += 1
                 
+                # 记录详细的日志信息
+                logs = {
+                    "loss": loss.detach().item(),
+                    "lr": lr_scheduler.get_last_lr()[0],
+                    "step": global_step,
+                    "epoch": epoch
+                }
+                if args.use_ema:
+                    logs["ema_decay"] = ema_model.cur_decay_value
+                
+                # 使用accelerator记录日志
+                accelerator.log(logs, step=global_step)
+                
+                # 在控制台输出日志
+                if accelerator.is_main_process and global_step % 10 == 0:
+                    logger.info(
+                        f"步骤 {global_step}: "
+                        f"损失: {logs['loss']:.4f}, "
+                        f"学习率: {logs['lr']:.6f}, "
+                        f"轮次: {logs['epoch']}"
+                    )
+                
+                # 更新进度条
+                epoch_progress_bar.update(1)
+                epoch_progress_bar.set_postfix(**logs)
+                
                 # 保存检查点
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
@@ -738,10 +759,12 @@ def main():
                     loss=f"{current_loss:.4f}",
                     lr=f"{current_lr:.6f}"
                 )
-                epoch_progress_bar.update(min(5, len(train_dataloader) - epoch_progress_bar.n))
+                # 不在这里更新进度条，而是在sync_gradients时更新
+                # epoch_progress_bar.update(min(5, num_update_steps_per_epoch - epoch_progress_bar.n))
             
         # 确保进度条完成
-        epoch_progress_bar.update(len(train_dataloader) - epoch_progress_bar.n)
+        # 不需要在这里更新进度条，因为我们已经在每个梯度累积步骤中更新了
+        # epoch_progress_bar.update(num_update_steps_per_epoch - epoch_progress_bar.n)
         
         # 计算平均损失
         avg_loss = epoch_loss / len(train_dataloader)
@@ -755,6 +778,15 @@ def main():
             last_lr=f"{lr_scheduler.get_last_lr()[0]:.6f}"
         )
         progress_bar.update(1)
+        
+        # 在轮次结束时输出详细的摘要信息
+        if accelerator.is_main_process:
+            logger.info(
+                f"轮次 {epoch+1}/{args.num_train_epochs} 完成: "
+                f"平均损失: {avg_loss:.4f}, "
+                f"学习率: {lr_scheduler.get_last_lr()[0]:.6f}, "
+                f"全局步数: {global_step}"
+            )
         
         # 每轮结束时清理缓存
         if torch.cuda.is_available():
