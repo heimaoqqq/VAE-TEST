@@ -59,6 +59,38 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
             self._device = vae.device
         else:
             self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    def to(self, torch_device: Optional[Union[str, torch.device]] = None, silence_dtype_warnings: bool = False):
+        """
+        将模型迁移到指定设备
+        
+        Args:
+            torch_device: 目标设备，可以是字符串或torch.device对象
+            silence_dtype_warnings: 是否禁用数据类型警告
+        """
+        # 首先调用基类的to方法，处理基本组件
+        super().to(torch_device, silence_dtype_warnings)
+        
+        # 确保所有组件都被迁移到正确的设备
+        if torch_device is None:
+            return self
+        
+        # 创建正确的torch.device对象
+        if isinstance(torch_device, str):
+            torch_device = torch.device(torch_device)
+        
+        # 移动VAE
+        if self.vae is not None:
+            self.vae.to(torch_device)
+            
+        # 移动UNet (额外确认)
+        if self.unet is not None:
+            self.unet.to(torch_device)
+        
+        # 更新内部设备属性
+        self._device = torch_device
+            
+        return self
             
     def decode_latents(self, latents):
         """
