@@ -67,20 +67,10 @@ try:
     print("加载调度器...")
     scheduler = DDPMScheduler.from_pretrained(os.path.join(model_id, "scheduler"))
     
-    print("加载UNet模型...")
-    # 训练后的模型有特殊的嵌套结构，base_unet在unet子目录内
-    base_unet = UNet2DModel.from_pretrained(os.path.join(model_id, "unet", "base_unet"))
-    
-    # 创建条件UNet封装
-    print("创建条件UNet模型...")
-    cond_unet = CondUNet2DModel(base_unet=base_unet, num_users=31, user_embed_dim=64)
-    
-    # 检查是否有条件UNet的权重，如果有则加载
-    cond_unet_path = os.path.join(model_id, "unet", "pytorch_model.bin")
-    if os.path.exists(cond_unet_path):
-        print(f"发现条件UNet权重文件，加载中...")
-        state_dict = torch.load(cond_unet_path, map_location="cpu")
-        cond_unet.load_state_dict(state_dict)
+    print("加载条件UNet模型...")
+    # 直接使用CondUNet2DModel的from_pretrained方法加载整个条件UNet
+    # 这个方法会正确处理嵌套结构的unet目录
+    cond_unet = CondUNet2DModel.from_pretrained(os.path.join(model_id, "unet"))
     
     # 创建条件Pipeline
     print("创建条件Pipeline...")
@@ -106,20 +96,9 @@ if gpu_count > 1:
         print(f"正在为第二个GPU加载模型...")
         second_device = f"cuda:1"
         
-        # 手动加载第二个GPU上的组件
-        print("为第二个GPU加载UNet模型...")
-        # 使用相同的嵌套结构路径
-        base_unet2 = UNet2DModel.from_pretrained(os.path.join(model_id, "unet", "base_unet"))
-        
-        print("为第二个GPU创建条件UNet...")
-        cond_unet2 = CondUNet2DModel(base_unet=base_unet2, num_users=31, user_embed_dim=64)
-        
-        # 检查是否有条件UNet的权重，如果有则加载
-        cond_unet_path = os.path.join(model_id, "unet", "pytorch_model.bin")
-        if os.path.exists(cond_unet_path):
-            print(f"为第二个GPU加载条件UNet权重文件...")
-            state_dict = torch.load(cond_unet_path, map_location="cpu")
-            cond_unet2.load_state_dict(state_dict)
+        # 为第二个GPU加载条件UNet
+        print("为第二个GPU加载条件UNet模型...")
+        cond_unet2 = CondUNet2DModel.from_pretrained(os.path.join(model_id, "unet"))
         
         print("为第二个GPU创建Pipeline...")
         pipeline2 = CondLatentDiffusionPipeline(
