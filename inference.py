@@ -65,9 +65,6 @@ try:
     print("加载VAE模型...")
     vae = VQModel.from_pretrained(os.path.join(model_id, "vae"))
     
-    print("加载调度器...")
-    scheduler = DDPMScheduler.from_pretrained(os.path.join(model_id, "scheduler"))
-    
     print("加载条件UNet模型...")
     # 直接使用UNet2DModel的from_pretrained方法加载整个UNet
     unet = UNet2DModel.from_pretrained(os.path.join(model_id, "unet"))
@@ -76,7 +73,7 @@ try:
     print("创建条件Pipeline...")
     pipeline = CondLatentDiffusionPipeline(
         vae=vae,
-        scheduler=scheduler,
+        scheduler=DDPMScheduler.from_pretrained(os.path.join(model_id, "scheduler")),
         unet=unet
     )
 
@@ -109,7 +106,7 @@ if gpu_count > 1:
         print("为第二个GPU创建Pipeline...")
         pipeline2 = CondLatentDiffusionPipeline(
             vae=VQModel.from_pretrained(os.path.join(model_id, "vae")),  # 创建新的VAE实例
-            scheduler=scheduler,  # 调度器不需要移动到GPU
+            scheduler=DDPMScheduler.from_pretrained(os.path.join(model_id, "scheduler")),  # 创建新的调度器实例
             unet=unet2
         )
         
