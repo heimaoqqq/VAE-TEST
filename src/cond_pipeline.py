@@ -50,7 +50,15 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
         )
 
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
-
+        
+        # 设置内部设备属性，基类的device属性会使用这个
+        if hasattr(unet, 'device'):
+            self._device = unet.device
+        elif hasattr(vae, 'device'):
+            self._device = vae.device
+        else:
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            
     @torch.no_grad()
     def __call__(
             self,
@@ -108,7 +116,6 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
                     print("继续使用单GPU模式")
         
         # 确定正确的设备
-        device = self.device
         unet_config = None
         unet_dtype = None
         
@@ -141,9 +148,9 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
         # 处理user_ids，确保它在正确的设备上
         if user_ids is not None:
             if not torch.is_tensor(user_ids):
-                user_ids = torch.tensor([user_ids], device=device)
-            elif user_ids.device != device:
-                user_ids = user_ids.to(device)
+                user_ids = torch.tensor([user_ids], device=self.device)
+            elif user_ids.device != self.device:
+                user_ids = user_ids.to(self.device)
             
             # 确保user_ids长度与batch_size一致
             if len(user_ids) == 1 and batch_size > 1:
@@ -185,13 +192,13 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
             )
 
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=unet_dtype)
+            latents = randn_tensor(shape, generator=generator, device=self.device, dtype=unet_dtype)
         else:
             if latents.shape != shape:
                 raise ValueError(
                     f"latents形状不匹配，期望{shape}，实际{latents.shape}"
                 )
-            latents = latents.to(device)
+            latents = latents.to(self.device)
 
         # scale the initial noise by the standard deviation required by the scheduler
         latents = latents * self.scheduler.init_noise_sigma
@@ -205,7 +212,7 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
         # 使用tqdm显示进度
         for t in tqdm(self.scheduler.timesteps, desc="生成进度"):
             # 确保时间步是正确的形状
-            t_tensor = torch.full((batch_size,), t, device=device, dtype=torch.long)
+            t_tensor = torch.full((batch_size,), t, device=self.device, dtype=torch.long)
             
             # 当前latents
             current_latents = latents
