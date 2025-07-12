@@ -361,16 +361,22 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
             
             # 条件生成
             if guidance_scale > 1.0 and user_ids is not None:
-                # 运行无条件前向传播 - 使用-1作为无条件标记
+                # 创建扩展批次（一半无条件，一半条件）
                 uncond_ids = torch.full_like(user_ids, -1)
                 
-                # 直接调用模型，让模型内部处理DataParallel的情况
+                # 在推理时，保留原始latents用于更好的条件引导
+                # 运行无条件前向传播
                 noise_pred_uncond = self.unet(latents, t_tensor, user_ids=uncond_ids).sample
                 
                 # 运行条件前向传播
                 noise_pred_cond = self.unet(latents, t_tensor, user_ids=user_ids).sample
                 
-                # 进行引导组合
+                # 分析两种噪声预测的差异
+                diff_magnitude = torch.norm(noise_pred_cond - noise_pred_uncond).item()
+                if t == self.scheduler.timesteps[0]:
+                    print(f"条件与无条件噪声预测差异大小: {diff_magnitude:.6f}")
+                
+                # 增强引导效果 - 使用classifier-free guidance公式
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_cond - noise_pred_uncond)
             else:
                 # 直接运行前向传播
