@@ -37,7 +37,6 @@ from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate
 from diffusers.utils.import_utils import is_xformers_available
 
-from src.cond_unet import CondUNet2DModel
 from src.cond_pipeline import CondLatentDiffusionPipeline
 
 logger = get_logger(__name__, log_level="INFO")
@@ -302,374 +301,230 @@ class MicroDopplerDataset(torch.utils.data.Dataset):
                 if count > 0:
                     print(f"  - ID_{folder_id} (内部ID: {model_user_id}) 有 {count} 张图像")
         
+        self.num_users = len(self.user_map)
+        print(f"数据加载器初始化完成，共找到 {self.num_users} 个用户")
+
     def __len__(self):
         return len(self.image_paths)
-        
+
     def __getitem__(self, idx):
-        image_path = self.image_paths[idx]
+        img_path = self.image_paths[idx]
         user_id = self.user_ids[idx]
         
-        image = Image.open(image_path).convert("RGB")
+        image = Image.open(img_path).convert("RGB")
         
-        if self._transform is not None:
-            image = self._transform(image)
-            
-        return {
-            "input": image,
-            "user_id": user_id,
-        }
+        # 应用图像变换
+        image = self.transform(image)
+
+        return {"pixel_values": image, "user_ids": user_id}
 
 
 def main():
     args = parse_args()
-    
     logging_dir = os.path.join(args.output_dir, "logs")
-    accelerator_project_config = ProjectConfiguration(
-        project_dir=args.output_dir, logging_dir=logging_dir
-    )
     
-    # 添加优化选项
-    kwargs = {}
-    
-    # 使用简单的初始化方式，避免兼容性问题
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
-        project_config=accelerator_project_config,
+        project_dir=logging_dir,
     )
-    
-    # 设置日志器
+
+    # 日志记录
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.ERROR,  # 将默认级别改为ERROR，几乎不输出日志
+        level=logging.INFO,
     )
-    # 设置日志级别，减少不必要的输出
+    logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
-        logger.setLevel(logging.ERROR)  # 主进程也只显示错误
+        transformers.utils.logging.set_verbosity_warning()
+        diffusers.utils.logging.set_verbosity_info()
     else:
-        logger.setLevel(logging.ERROR)  # 非主进程只显示错误信息
-        
-    # 不显示accelerator状态
-    # logger.info(accelerator.state, main_process_only=True)
-    
+        transformers.utils.logging.set_verbosity_error()
+        diffusers.utils.logging.set_verbosity_error()
+
     # 设置随机种子
     if args.seed is not None:
         set_seed(args.seed)
-        
-    # 处理输出目录
+
+    # 创建输出目录
     if accelerator.is_main_process:
         os.makedirs(args.output_dir, exist_ok=True)
+
+    # 加载模型: VAE, UNet, Scheduler
+    # 1. VAE
+    # 使用CompVis/ldm-celebahq-256的VQ-VAE，因为它与256x256图像匹配
+    vae = VQModel.from_pretrained("CompVis/ldm-celebahq-256", subfolder="vqvae")
     
-    # 准备模型组件
-    # logger.info(f"准备模型组件")
-    
-    # 检查是从头开始训练还是基于预训练模型
-    if args.pretrained_model_path and os.path.exists(args.pretrained_model_path):
-        # logger.info(f"从预训练模型加载组件: {args.pretrained_model_path}")
-        logger.warning(f"从预训练模型加载组件: {args.pretrained_model_path}")
-        # 加载预训练的无条件模型组件
-        from src.pipeline import UncondLatentDiffusionPipeline
-        temp_pipeline = UncondLatentDiffusionPipeline.from_pretrained(args.pretrained_model_path)
-        
-        # 提取组件
-        vae = temp_pipeline.vae
-        scheduler = temp_pipeline.scheduler
-        base_unet = temp_pipeline.unet
-        
-        # 释放临时pipeline
-        del temp_pipeline
-    else:
-        # logger.info("从头初始化模型组件")
-        logger.warning("从头初始化模型组件")
-        # 创建新的VAE模型
-        vae = VQModel(
-            in_channels=3,
-            out_channels=3,
-            down_block_types=["DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"],
-            up_block_types=["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"],
-            block_out_channels=[128, 256, 512],
-            latent_channels=3,
-            sample_size=args.resolution // 8,  # VAE的输出分辨率
-        )
-        
-        # 创建UNet模型
-        base_unet = UNet2DModel(
-            sample_size=args.resolution // 8,  # 与VAE的latent空间大小匹配
-            in_channels=3,
-            out_channels=3,
-            layers_per_block=2,
-            block_out_channels=(128, 256, 512, 512),
-            down_block_types=(
-                "DownBlock2D",
-                "DownBlock2D",
-                "AttnDownBlock2D",
-                "DownBlock2D",
-            ),
-            up_block_types=(
-                "UpBlock2D",
-                "AttnUpBlock2D",
-                "UpBlock2D",
-                "UpBlock2D",
-            ),
-        )
-        
-        # 创建调度器
-        scheduler = DDPMScheduler(
-            num_train_timesteps=1000,
-            beta_start=0.0001,
-            beta_end=0.02,
-            beta_schedule="linear",
-            clip_sample=False,
-        )
-    
-    # 创建条件UNet
-    # logger.info(f"创建条件UNet模型，用户嵌入维度: {args.user_embed_dim}")
-    unet = CondUNet2DModel(
-        base_unet=base_unet, 
-        num_users=args.num_users, 
-        user_embed_dim=args.user_embed_dim,
-        freeze_unet=False  # 不冻结基础UNet，让整个网络一起训练
+    # 2. Scheduler
+    noise_scheduler = DDPMScheduler(
+        num_train_timesteps=1000,
+        beta_schedule="linear",
     )
-    
-    # 如果PyTorch版本支持，使用torch.compile加速模型
-    try:
-        # 只在PyTorch 2.0+且CUDA可用的情况下尝试使用torch.compile
-        if hasattr(torch, 'compile') and torch.__version__ >= "2.0.0" and torch.cuda.is_available():
-            # logger.info("检测到PyTorch 2.0+，尝试使用torch.compile优化模型")
-            # 使用最安全的模式，或者完全禁用
-            # unet = torch.compile(unet, mode="reduce-overhead")
-            logger.warning("由于索引操作兼容性问题，跳过torch.compile优化")
-            # 不应用torch.compile，以避免索引操作的问题
-            pass
-    except Exception as e:
-        # logger.warning(f"torch.compile优化失败: {e}，跳过优化")
-        pass
-    
-    # 设置调度器
-    noise_scheduler = scheduler
-    
-    # 加载数据集
-    train_dataset = MicroDopplerDataset(
-        data_dir=args.dataset_path,
-        resolution=args.resolution,
-        center_crop=True,
-        is_main_process=accelerator.is_main_process,
+
+    # 3. UNet (用支持条件的标准UNet替换CondUNet)
+    # 使用与无条件训练脚本类似的UNet配置，但添加class-conditioning
+    unet = UNet2DModel(
+        sample_size=vae.config.sample_size,
+        in_channels=3,  # VQ-VAE的潜在空间通道数为3
+        out_channels=3,
+        layers_per_block=2,
+        block_out_channels=(128, 128, 256, 256, 512, 512),
+        down_block_types=(
+            "DownBlock2D", "DownBlock2D", "DownBlock2D", "DownBlock2D", "AttnDownBlock2D", "DownBlock2D"
+        ),
+        up_block_types=(
+            "UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"
+        ),
+        num_class_embeds=args.num_users + 1,  # +1 用于无条件生成
+        class_embed_type="identity",  # 类别ID直接作为嵌入索引
     )
+
+    # 冻结VAE
+    vae.requires_grad_(False)
     
-    # 确定合适的num_workers数量
-    try:
-        import multiprocessing
-        num_cpus = multiprocessing.cpu_count()
-        # 使用保守的设置
-        num_workers = 2  # 固定使用2个工作进程，避免过多worker导致问题
-        # logger.info(f"数据加载器使用 {num_workers} 个工作进程")
-    except Exception as e:
-        # 如果无法确定CPU数量，使用默认值
-        num_workers = 0
-        # logger.warning(f"无法确定CPU数量: {e}，不使用额外的工作进程")
-    
-    # 创建数据加载器
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        num_workers=num_workers,
-    )
-    
-    # 计算训练步数 - 在创建优化器和学习率调度器之前
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * len(train_dataloader)
-        # logger.info(f"设置总训练步数为: {args.max_train_steps}")
-    else:
-        args.num_train_epochs = math.ceil(args.max_train_steps / len(train_dataloader))
-        # logger.info(f"根据max_train_steps计算训练轮数: {args.num_train_epochs}")
-    
-    # 设置优化器
+    # 启用xformers以节省内存
+    if args.enable_xformers_memory_efficient_attention:
+        if is_xformers_available():
+            import xformers
+            
+            xformers_version = version.parse(xformers.__version__)
+            if xformers_version >= version.parse("0.0.16"):
+                logger.info("使用xFormers内存高效注意力机制")
+                unet.enable_xformers_memory_efficient_attention()
+            else:
+                warnings.warn("xFormers版本过低，建议升级到0.0.16或更高版本")
+        else:
+            warnings.warn("未安装xFormers，无法启用内存高效注意力机制")
+            
+    # 优化器
     if args.use_8bit_adam:
         try:
             import bitsandbytes as bnb
         except ImportError:
-            raise ImportError(
-                "要使用 8-bit Adam，请先安装bitsandbytes: `pip install bitsandbytes`"
-            )
+            raise ImportError("请先安装bitsandbytes: `pip install bitsandbytes`")
         optimizer_cls = bnb.optim.AdamW8bit
     else:
         optimizer_cls = torch.optim.AdamW
-        
-    params_to_optimize = unet.parameters()
-    
+
     optimizer = optimizer_cls(
-        params_to_optimize,
+        unet.parameters(),
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
+
+    # 数据集
+    dataset = MicroDopplerDataset(
+        data_dir=args.dataset_path,
+        resolution=args.resolution,
+    )
     
-    # 设置学习率调度器 - 现在max_train_steps已经计算好了
+    # 更新args.num_users以匹配数据集中找到的实际用户数
+    if args.num_users != dataset.num_users:
+        logger.info(f"更新用户数量从 {args.num_users} 到 {dataset.num_users}")
+        args.num_users = dataset.num_users
+
+    dataloader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+    )
+
+    # 学习率调度器
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * args.gradient_accumulation_steps,
-        num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
+        num_warmup_steps=args.lr_warmup_steps,
+        num_training_steps=(len(dataloader) * args.num_train_epochs),
     )
-    
-    # 准备加速器
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
-    )
-    
-    # 设置EMA
+
+    # EMA模型
     if args.use_ema:
-        ema_unet = CondUNet2DModel(
-            base_unet=base_unet,
-            num_users=args.num_users,
-            user_embed_dim=args.user_embed_dim
+        ema_unet = EMAModel(
+            unet.parameters(), 
+            decay=0.9999, 
+            model_cls=UNet2DModel, 
+            model_config=unet.config
         )
+
+    # 准备所有组件
+    unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, dataloader, lr_scheduler
+    )
+
+    if args.use_ema:
         ema_unet.to(accelerator.device)
-        # 修复EMA初始化，不使用model_config参数
-        ema_model = EMAModel(
-            ema_unet.parameters(),
-            decay=0.9999
-        )
-    
-    # 设置xFormers优化
-    if args.enable_xformers_memory_efficient_attention:
-        if is_xformers_available():
-            unet.unet.enable_xformers_memory_efficient_attention()
-        else:
-            raise ValueError("xFormers未安装，无法启用内存高效注意力")
-    
-    # 启用TF32精度
-    if args.allow_tf32:
-        torch.backends.cuda.matmul.allow_tf32 = True
-    
-    # 权重数据类型
-    weight_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        weight_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        weight_dtype = torch.bfloat16
-        
-    # 将VAE移动到设备上并设置为评估模式
-    vae.to(accelerator.device, dtype=weight_dtype)
-    vae.eval()
-    
-    # 打印训练信息摘要
+
+    # 将模型移动到设备
+    vae.to(accelerator.device)
+
+    # 计算总训练步数
+    num_update_steps_per_epoch = math.ceil(len(dataloader) / args.gradient_accumulation_steps)
+    if args.max_train_steps is None:
+        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
+    else:
+        args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
+    # 初始化跟踪器
     if accelerator.is_main_process:
-        total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
-        # 以下日志输出已被注释掉
-        # logger.info("***** 训练信息 *****")
-        # logger.info(f"  数据集大小 = {len(train_dataset)}")
-        # logger.info(f"  轮次数 = {args.num_train_epochs}")
-        # logger.info(f"  每个设备的批次大小 = {args.train_batch_size}")
-        # logger.info(f"  总批次大小 (包括并行、分布式和梯度累积) = {total_batch_size}")
-        # logger.info(f"  梯度累积步数 = {args.gradient_accumulation_steps}")
-        # logger.info(f"  总训练步数 = {args.max_train_steps}")
-        # logger.info(f"  混合精度 = {args.mixed_precision}")
-        # logger.info(f"  用户数量 = {args.num_users}")
-        # logger.info(f"  用户嵌入维度 = {args.user_embed_dim}")
-        # logger.info(f"  无条件训练概率 = {args.uncond_prob}")
-        # logger.info("**********************")
+        accelerator.init_trackers("train_cond_microdoppler", config=vars(args))
+
+    # 开始训练
+    total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+    logger.info("***** 开始训练 *****")
+    logger.info(f"  总样本数 = {len(dataset)}")
+    logger.info(f"  总轮数 = {args.num_train_epochs}")
+    logger.info(f"  每个设备批次大小 = {args.train_batch_size}")
+    logger.info(f"  总训练批次大小 = {total_batch_size}")
+    logger.info(f"  梯度累积步数 = {args.gradient_accumulation_steps}")
+    logger.info(f"  总优化步数 = {args.max_train_steps}")
     
-    # 计算每个轮次的更新步数
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    
-    # 不使用tqdm进度条，而是使用简单的输出
     global_step = 0
-    
-    # 从检查点恢复训练
-    if args.resume_from_checkpoint:
-        if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
-        else:
-            # 获取最新检查点
-            dirs = os.listdir(args.output_dir)
-            dirs = [d for d in dirs if d.startswith("checkpoint")]
-            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
-            path = dirs[-1] if len(dirs) > 0 else None
-            
-        if path is None:
-            if accelerator.is_local_main_process:
-                print(f"检查点'{args.resume_from_checkpoint}'未找到，从头开始训练")
-            args.resume_from_checkpoint = None
-        else:
-            if accelerator.is_local_main_process:
-                print(f"从检查点'{path}'恢复训练")
-            path = os.path.join(args.output_dir, path)
-            accelerator.load_state(path)
-            global_step = int(path.split("-")[1])
-            
-            # 计算对应的轮次和步骤
-            resume_epoch = global_step // num_update_steps_per_epoch
-            resume_step = global_step % num_update_steps_per_epoch
-            
-            # 更新进度条
-            # progress_bar.update(resume_epoch) # 移除tqdm更新
-            if accelerator.is_local_main_process:
-                print(f"从轮次 {resume_epoch} 恢复训练")
-            
-            # logger.info(f"从步骤 {global_step} (轮次 {resume_epoch}, 步骤 {resume_step}) 恢复训练")
-    
-    # 启用性能分析
-    torch.cuda.empty_cache()  # 清空缓存，确保有足够的GPU内存
-    
-    # 显示GPU信息
-    if torch.cuda.is_available() and accelerator.is_local_main_process:
-        try:
-            gpu_count = torch.cuda.device_count()
-            # logger.info(f"可用GPU数量: {gpu_count}")
-            for i in range(gpu_count):
-                gpu_name = torch.cuda.get_device_name(i)
-                gpu_mem = torch.cuda.get_device_properties(i).total_memory / (1024**3)  # GB
-                # logger.info(f"GPU {i}: {gpu_name}, 内存: {gpu_mem:.2f} GB")
-        except Exception as e:
-            # logger.warning(f"无法获取GPU信息: {e}")
-            pass
-    
-    # 训练循环
-    for epoch in range(args.num_train_epochs):
+    first_epoch = 0
+
+    # 进度条
+    progress_bar = tqdm(
+        range(global_step, args.max_train_steps), 
+        disable=not accelerator.is_local_main_process
+    )
+    progress_bar.set_description("训练步数")
+
+    for epoch in range(first_epoch, args.num_train_epochs):
         unet.train()
-        
-        # 记录每个轮次的统计信息
-        epoch_loss = 0.0
-        epoch_step = 0
-        start_time = time.time()
-        
-        # 输出epoch开始信息
-        if accelerator.is_local_main_process:
-            print(f"\n开始训练第 {epoch+1}/{args.num_train_epochs} 轮...")
-        
-        for step, batch in enumerate(train_dataloader):
+        train_loss = 0.0
+        for step, batch in enumerate(dataloader):
             with accelerator.accumulate(unet):
-                # 模型训练代码保持不变，但不输出日志
-                # 转换为潜在表示
-                clean_images = batch["input"].to(accelerator.device, non_blocking=True)
-                with torch.no_grad():
-                    # 确保输入图像与VAE使用相同的数据类型
-                    clean_images = clean_images.to(dtype=weight_dtype)
-                    latents = vae.encode(clean_images).latents
-                    latents = latents * 0.18215
+                # 将图像编码到潜在空间
+                latents = vae.encode(batch["pixel_values"].to(accelerator.device)).latents
+                
+                # 添加噪声
+                noise = torch.randn_like(latents)
+                bsz = latents.shape[0]
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = timesteps.long()
+                
+                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 
                 # 获取用户ID
-                user_ids = batch["user_id"].to(accelerator.device, non_blocking=True)
+                user_ids = batch["user_ids"].to(accelerator.device)
                 
-                # 随机丢弃部分条件
-                batch_size = clean_images.shape[0]
-                uncond_mask = torch.rand(batch_size, device=accelerator.device) < args.uncond_prob
-                if uncond_mask.any():
-                    user_ids_with_uncond = user_ids.clone()
-                    user_ids_with_uncond[uncond_mask] = -1  # 使用-1表示无条件
-                    user_ids = user_ids_with_uncond
+                # 以一定概率进行无条件训练
+                uncond_mask = torch.rand(user_ids.shape[0], device=user_ids.device) < args.uncond_prob
+                # 无条件ID为num_users
+                user_ids[uncond_mask] = args.num_users
                 
-                # 训练步骤
-                noise = torch.randn_like(latents)
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=latents.device).long()
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                model_pred = unet(noisy_latents, timesteps, user_ids=user_ids).sample
-                loss = F.mse_loss(model_pred, noise, reduction="mean")
+                # 预测噪声
+                noise_pred = unet(noisy_latents, timesteps, class_labels=user_ids).sample
+                
+                # 计算损失
+                loss = F.mse_loss(noise_pred.float(), noise.float(), reduction="mean")
+                
+                # 累积损失
+                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+                train_loss += avg_loss.item() / args.gradient_accumulation_steps
                 
                 # 反向传播
                 accelerator.backward(loss)
@@ -677,173 +532,49 @@ def main():
                     accelerator.clip_grad_norm_(unet.parameters(), 1.0)
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-                
-                # 累积损失
-                epoch_loss += loss.detach().item()
-                epoch_step += 1
-                
-            # 更新EMA模型
-            if args.use_ema and accelerator.sync_gradients:
-                ema_model.step(unet.parameters())
-                
-            # 更新步数
+                optimizer.zero_grad()
+
+            # 更新进度
             if accelerator.sync_gradients:
+                if args.use_ema:
+                    ema_unet.step(unet.parameters())
+                progress_bar.update(1)
                 global_step += 1
-                
-                # 每隔一定步数显示一次进度
-                if accelerator.is_local_main_process and global_step % 10 == 0:
-                    # 计算当前进度百分比
-                    progress = step / len(train_dataloader) * 100
-                    current_loss = loss.detach().item()
-                    current_lr = lr_scheduler.get_last_lr()[0]
-                    
-                    # 使用\r来更新同一行
-                    print(f"\r轮次 {epoch+1}/{args.num_train_epochs} "
-                          f"[{progress:.0f}%] "
-                          f"step {step}/{len(train_dataloader)} "
-                          f"loss={current_loss:.4f} "
-                          f"lr={current_lr:.6f}", end="")
-                
-                # 静默记录日志
-                accelerator.log({
-                    "loss": loss.detach().item(),
-                    "lr": lr_scheduler.get_last_lr()[0],
-                }, step=global_step)
-                
-                # 移除按步数保存检查点的逻辑
-    
-        # 计算平均损失
-        avg_loss = epoch_loss / epoch_step if epoch_step > 0 else 0
-        end_time = time.time()
+                accelerator.log({"train_loss": train_loss}, step=global_step)
+                train_loss = 0.0
+
+            if global_step >= args.max_train_steps:
+                break
         
-        # 在每个epoch结束时输出详细信息
-        if accelerator.is_local_main_process:
-            elapsed_time = end_time - start_time
-            hours, rem = divmod(elapsed_time, 3600)
-            minutes, seconds = divmod(rem, 60)
-            
-            print(f"\n轮次 {epoch+1}/{args.num_train_epochs} 完成 | "
-                  f"用时: {int(hours):02d}:{int(minutes):02d}:{seconds:05.2f} | "
-                  f"平均损失: {avg_loss:.4f} | "
-                  f"学习率: {lr_scheduler.get_last_lr()[0]:.6f} | "
-                  f"步数: {global_step}")
-        
-        # 每个epoch结束时保存检查点
+        # 每隔一定轮数保存模型
         if accelerator.is_main_process:
-            # 创建检查点路径
-            checkpoint_path = os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}")
-            
-            # 删除旧的检查点（保留当前epoch的检查点）
-            checkpoints = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint-epoch-")]
-            for old_ckpt in checkpoints:
-                old_ckpt_path = os.path.join(args.output_dir, old_ckpt)
-                if old_ckpt_path != checkpoint_path and os.path.exists(old_ckpt_path):
-                    shutil.rmtree(old_ckpt_path, ignore_errors=True)
-            
-            # 静默保存检查点
-            if accelerator.is_local_main_process:
-                print(f"保存检查点到 {checkpoint_path}")
-            
-            original_stdout = sys.stdout
-            sys.stdout = open(os.devnull, 'w')
-            try:
-                accelerator.save_state(checkpoint_path)
-            finally:
-                sys.stdout.close()
-                sys.stdout = original_stdout
-        
-        # 每轮结束时清理缓存
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-            
-        # 保存模型
-        if accelerator.is_main_process:
-            if epoch % args.save_model_epochs == 0 or epoch == args.num_train_epochs - 1:
-                # 使用EMA模型或当前模型
-                if args.use_ema:
-                    ema_model.store(unet.parameters())
-                    ema_model.copy_to(unet.parameters())
-                    
-                # 获取unwrapped模型
-                unet_unwrapped = accelerator.unwrap_model(unet)
-                
-                # 保存条件UNet模型 - 修改为分别保存组件
-                print(f"保存模型到 {args.output_dir}")
-                
-                # 清理旧的模型文件
-                model_files = ["model_index.json", "scheduler", "unet", "vae"]
-                for file_or_dir in model_files:
-                    path = os.path.join(args.output_dir, file_or_dir)
-                    if os.path.isdir(path):
-                        shutil.rmtree(path, ignore_errors=True)
-                    elif os.path.isfile(path):
-                        os.remove(path)
-                
-                # 分别保存各组件
-                unet_unwrapped.save_pretrained(os.path.join(args.output_dir, "unet"))
-                scheduler.save_pretrained(os.path.join(args.output_dir, "scheduler"))
-                vae.save_pretrained(os.path.join(args.output_dir, "vae"))
-                
-                # 创建model_index.json
-                model_index = {
-                    "components": ["unet", "scheduler", "vae"],
-                    "_class_name": "CondLatentDiffusionPipeline",
-                    "_diffusers_version": diffusers.__version__
-                }
-                with open(os.path.join(args.output_dir, "model_index.json"), "w") as f:
-                    json.dump(model_index, f)
-                
-                # 恢复原始权重
-                if args.use_ema:
-                    ema_model.restore(unet.parameters())
-        
-        # 检查是否完成训练
-        if global_step >= args.max_train_steps:
-            break
+            if (epoch + 1) % args.save_model_epochs == 0 or epoch == args.num_train_epochs - 1:
+                # 创建pipeline并保存
+                pipeline = CondLatentDiffusionPipeline(
+                    vae=vae,
+                    scheduler=noise_scheduler,
+                    unet=accelerator.unwrap_model(unet) if not args.use_ema else ema_unet.averaged_model
+                )
+                pipeline.save_pretrained(os.path.join(args.output_dir, f"checkpoint-epoch-{epoch+1}"))
+                logger.info(f"在 epoch {epoch+1} 保存模型检查点")
+
+    accelerator.wait_for_everyone()
     
     # 保存最终模型
-    accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        # 使用EMA模型或当前模型
+        unet_final = accelerator.unwrap_model(unet)
         if args.use_ema:
-            ema_model.store(unet.parameters())
-            ema_model.copy_to(unet.parameters())
+            ema_unet.copy_to(unet_final.parameters())
             
-        # 获取unwrapped模型
-        unet = accelerator.unwrap_model(unet)
-        
-        # 保存条件UNet模型 - 修改为分别保存组件
-        print(f"保存最终模型到 {args.output_dir}")
-        
-        # 清理旧的模型文件
-        model_files = ["model_index.json", "scheduler", "unet", "vae"]
-        for file_or_dir in model_files:
-            path = os.path.join(args.output_dir, file_or_dir)
-            if os.path.isdir(path):
-                shutil.rmtree(path, ignore_errors=True)
-            elif os.path.isfile(path):
-                os.remove(path)
-        
-        # 分别保存各组件
-        unet.save_pretrained(os.path.join(args.output_dir, "unet"))
-        scheduler.save_pretrained(os.path.join(args.output_dir, "scheduler"))
-        vae.save_pretrained(os.path.join(args.output_dir, "vae"))
-        
-        # 创建model_index.json
-        model_index = {
-            "components": ["unet", "scheduler", "vae"],
-            "_class_name": "CondLatentDiffusionPipeline",
-            "_diffusers_version": diffusers.__version__
-        }
-        with open(os.path.join(args.output_dir, "model_index.json"), "w") as f:
-            json.dump(model_index, f)
-        
-        # 恢复原始权重
-        if args.use_ema:
-            ema_model.restore(unet.parameters())
-    
+        pipeline = CondLatentDiffusionPipeline(
+            vae=vae,
+            scheduler=noise_scheduler,
+            unet=unet_final,
+        )
+        pipeline.save_pretrained(args.output_dir)
+
     accelerator.end_training()
 
+
 if __name__ == "__main__":
-    main() 
+    main()
