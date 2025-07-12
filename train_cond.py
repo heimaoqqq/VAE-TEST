@@ -356,6 +356,12 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
+    # 设置日志级别，减少不必要的输出
+    if accelerator.is_local_main_process:
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.WARNING)
+        
     logger.info(accelerator.state, main_process_only=False)
     
     # 设置随机种子
@@ -533,11 +539,30 @@ def main():
     vae.to(accelerator.device, dtype=weight_dtype)
     vae.eval()
     
+    # 打印训练信息摘要
+    if accelerator.is_main_process:
+        total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
+        logger.info("***** 训练信息 *****")
+        logger.info(f"  数据集大小 = {len(train_dataset)}")
+        logger.info(f"  轮次数 = {args.num_train_epochs}")
+        logger.info(f"  每个设备的批次大小 = {args.train_batch_size}")
+        logger.info(f"  总批次大小 (包括并行、分布式和梯度累积) = {total_batch_size}")
+        logger.info(f"  梯度累积步数 = {args.gradient_accumulation_steps}")
+        logger.info(f"  总训练步数 = {args.max_train_steps}")
+        logger.info(f"  混合精度 = {args.mixed_precision}")
+        logger.info(f"  用户数量 = {args.num_users}")
+        logger.info(f"  用户嵌入维度 = {args.user_embed_dim}")
+        logger.info(f"  无条件训练概率 = {args.uncond_prob}")
+        logger.info("**********************")
+    
     # 计算每个轮次的更新步数
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     
     # 设置进度条 - 使用轮次而非总步数
-    progress_bar = tqdm(range(args.num_train_epochs), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(args.num_train_epochs), 
+                        disable=not accelerator.is_local_main_process,
+                        dynamic_ncols=True,  # 动态调整宽度
+                        leave=True)  # 保留进度条
     progress_bar.set_description("训练轮次")
     
     global_step = 0
@@ -576,7 +601,11 @@ def main():
     for epoch in range(args.num_train_epochs):
         unet.train()
         # 为每个轮次创建一个内部进度条
-        epoch_progress_bar = tqdm(total=len(train_dataloader), disable=not accelerator.is_local_main_process)
+        epoch_progress_bar = tqdm(total=len(train_dataloader), 
+                                  disable=not accelerator.is_local_main_process,
+                                  dynamic_ncols=True,  # 动态调整宽度
+                                  leave=False,  # 不保留进度条，只显示当前轮次
+                                  position=0)   # 固定位置
         epoch_progress_bar.set_description(f"轮次 {epoch+1}/{args.num_train_epochs}")
         
         # 记录每个轮次的平均损失
@@ -645,7 +674,8 @@ def main():
                     if accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
-                        logger.info(f"在{save_path}保存检查点")
+                        # 使用进度条而非日志记录检查点信息
+                        epoch_progress_bar.write(f"保存检查点到 {save_path}")
                         
                         # 删除旧检查点
                         if args.checkpoints_total_limit is not None:
@@ -657,11 +687,16 @@ def main():
                                 for old_ckpt in checkpoints[:num_to_remove]:
                                     old_ckpt_path = os.path.join(args.output_dir, old_ckpt)
                                     shutil.rmtree(old_ckpt_path)
-                                    logger.info(f"删除旧检查点{old_ckpt_path}")
+                                    epoch_progress_bar.write(f"删除旧检查点 {old_ckpt_path}")
                 
             # 更新内部进度条，显示当前步骤和损失
+            current_loss = loss.detach().item()
+            current_lr = lr_scheduler.get_last_lr()[0]
+            epoch_progress_bar.set_postfix(
+                loss=f"{current_loss:.4f}",
+                lr=f"{current_lr:.6f}"
+            )
             epoch_progress_bar.update(1)
-            epoch_progress_bar.set_postfix(loss=loss.detach().item(), lr=lr_scheduler.get_last_lr()[0])
         
         # 计算平均损失
         avg_loss = epoch_loss / len(train_dataloader)
@@ -670,8 +705,11 @@ def main():
         epoch_progress_bar.close()
         
         # 更新外部进度条，显示平均损失
+        progress_bar.set_postfix(
+            avg_loss=f"{avg_loss:.4f}",
+            last_lr=f"{lr_scheduler.get_last_lr()[0]:.6f}"
+        )
         progress_bar.update(1)
-        progress_bar.set_postfix(avg_loss=avg_loss)
         
         # 生成示例图像
         if accelerator.is_main_process:
@@ -681,10 +719,13 @@ def main():
                     ema_model.store(unet.parameters())
                     ema_model.copy_to(unet.parameters())
                 
+                # 获取unwrapped模型
+                unet_unwrapped = accelerator.unwrap_model(unet)
+                
                 # 创建评估pipeline
                 pipeline = CondLatentDiffusionPipeline(
                     vae=vae,
-                    unet=unet,
+                    unet=unet_unwrapped,  # 使用unwrapped模型
                     scheduler=scheduler,
                 )
                 
