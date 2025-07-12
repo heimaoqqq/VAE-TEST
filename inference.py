@@ -58,22 +58,29 @@ try:
     print(f"正在从 {model_id} 加载模型组件...")
     start_time = time.time()
     
-    # 手动加载各个组件
+    # 手动加载各个组件并检查不同可能的路径
     from diffusers import DDPMScheduler, VQModel
     
     print("加载VAE模型...")
-    vae = VQModel.from_pretrained(model_id, subfolder="vae")
+    vae = VQModel.from_pretrained(os.path.join(model_id, "vae"))
     
     print("加载调度器...")
-    scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
+    scheduler = DDPMScheduler.from_pretrained(os.path.join(model_id, "scheduler"))
     
     print("加载UNet模型...")
-    # 先加载基础UNet模型
-    base_unet = UNet2DModel.from_pretrained(model_id, subfolder="unet")
+    # 训练后的模型有特殊的嵌套结构，base_unet在unet子目录内
+    base_unet = UNet2DModel.from_pretrained(os.path.join(model_id, "unet", "base_unet"))
     
     # 创建条件UNet封装
     print("创建条件UNet模型...")
     cond_unet = CondUNet2DModel(base_unet=base_unet, num_users=31, user_embed_dim=64)
+    
+    # 检查是否有条件UNet的权重，如果有则加载
+    cond_unet_path = os.path.join(model_id, "unet", "pytorch_model.bin")
+    if os.path.exists(cond_unet_path):
+        print(f"发现条件UNet权重文件，加载中...")
+        state_dict = torch.load(cond_unet_path, map_location="cpu")
+        cond_unet.load_state_dict(state_dict)
     
     # 创建条件Pipeline
     print("创建条件Pipeline...")
@@ -87,6 +94,8 @@ try:
     print(f"模型加载成功！耗时 {load_time:.2f} 秒")
 except Exception as e:
     print(f"加载模型时出错: {e}")
+    import traceback
+    traceback.print_exc()
     print("请检查模型路径和文件是否完整。")
     exit(1)
 
@@ -99,10 +108,18 @@ if gpu_count > 1:
         
         # 手动加载第二个GPU上的组件
         print("为第二个GPU加载UNet模型...")
-        base_unet2 = UNet2DModel.from_pretrained(model_id, subfolder="unet")
+        # 使用相同的嵌套结构路径
+        base_unet2 = UNet2DModel.from_pretrained(os.path.join(model_id, "unet", "base_unet"))
         
         print("为第二个GPU创建条件UNet...")
         cond_unet2 = CondUNet2DModel(base_unet=base_unet2, num_users=31, user_embed_dim=64)
+        
+        # 检查是否有条件UNet的权重，如果有则加载
+        cond_unet_path = os.path.join(model_id, "unet", "pytorch_model.bin")
+        if os.path.exists(cond_unet_path):
+            print(f"为第二个GPU加载条件UNet权重文件...")
+            state_dict = torch.load(cond_unet_path, map_location="cpu")
+            cond_unet2.load_state_dict(state_dict)
         
         print("为第二个GPU创建Pipeline...")
         pipeline2 = CondLatentDiffusionPipeline(
@@ -115,6 +132,8 @@ if gpu_count > 1:
         use_dual_pipeline = True
     except Exception as e:
         print(f"无法加载第二个模型实例: {e}")
+        import traceback
+        traceback.print_exc()
         print("将仅使用单个GPU")
         use_dual_pipeline = False
 else:
