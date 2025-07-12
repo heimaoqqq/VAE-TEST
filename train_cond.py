@@ -7,6 +7,7 @@ import shutil
 import warnings
 import sys
 import json
+import time
 from pathlib import Path
 
 import numpy as np
@@ -338,15 +339,15 @@ def main():
         project_config=accelerator_project_config,
     )
     
-    # 创建日志器
+    # 设置日志器
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
-        level=logging.WARNING,  # 将默认级别改为WARNING，减少INFO级别的输出
+        level=logging.ERROR,  # 将默认级别改为ERROR，几乎不输出日志
     )
     # 设置日志级别，减少不必要的输出
     if accelerator.is_local_main_process:
-        logger.setLevel(logging.WARNING)  # 将INFO改为WARNING
+        logger.setLevel(logging.ERROR)  # 主进程也只显示错误
     else:
         logger.setLevel(logging.ERROR)  # 非主进程只显示错误信息
         
@@ -576,14 +577,7 @@ def main():
     # 计算每个轮次的更新步数
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     
-    # 设置主进度条 - 显示整体训练进度
-    progress_bar = tqdm(range(args.num_train_epochs), 
-                        disable=not accelerator.is_local_main_process,
-                        dynamic_ncols=True,  # 动态调整宽度
-                        leave=True,        # 保留进度条
-                        position=0,       # 固定在首位置
-                        desc="训练轮次")  # 使用desc代替set_description
-    
+    # 不使用tqdm进度条，而是使用简单的输出
     global_step = 0
     
     # 从检查点恢复训练
@@ -599,11 +593,11 @@ def main():
             
         if path is None:
             if accelerator.is_local_main_process:
-                progress_bar.write(f"检查点'{args.resume_from_checkpoint}'未找到，从头开始训练")
+                print(f"检查点'{args.resume_from_checkpoint}'未找到，从头开始训练")
             args.resume_from_checkpoint = None
         else:
             if accelerator.is_local_main_process:
-                progress_bar.write(f"从检查点'{path}'恢复训练")
+                print(f"从检查点'{path}'恢复训练")
             path = os.path.join(args.output_dir, path)
             accelerator.load_state(path)
             global_step = int(path.split("-")[1])
@@ -613,9 +607,9 @@ def main():
             resume_step = global_step % num_update_steps_per_epoch
             
             # 更新进度条
-            progress_bar.update(resume_epoch)
+            # progress_bar.update(resume_epoch) # 移除tqdm更新
             if accelerator.is_local_main_process:
-                progress_bar.set_description(f"从轮次 {resume_epoch} 恢复训练")
+                print(f"从轮次 {resume_epoch} 恢复训练")
             
             # logger.info(f"从步骤 {global_step} (轮次 {resume_epoch}, 步骤 {resume_step}) 恢复训练")
     
@@ -639,19 +633,14 @@ def main():
     for epoch in range(args.num_train_epochs):
         unet.train()
         
-        # 使用命名参数而非位置参数来创建进度条
-        epoch_progress_bar = tqdm(
-            total=num_update_steps_per_epoch,
-            disable=not accelerator.is_local_main_process,
-            leave=False,     # 不保留旧的进度条
-            position=1,      # 放在主进度条下方
-            dynamic_ncols=True,
-            desc=f"Epoch {epoch+1}/{args.num_train_epochs}"
-        )
-        
         # 记录每个轮次的统计信息
         epoch_loss = 0.0
         epoch_step = 0
+        start_time = time.time()
+        
+        # 输出epoch开始信息
+        if accelerator.is_local_main_process:
+            print(f"\n开始训练第 {epoch+1}/{args.num_train_epochs} 轮...")
         
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
@@ -690,7 +679,7 @@ def main():
                 lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 
-                # 累积损失，用于最终统计
+                # 累积损失
                 epoch_loss += loss.detach().item()
                 epoch_step += 1
                 
@@ -698,18 +687,25 @@ def main():
             if args.use_ema and accelerator.sync_gradients:
                 ema_model.step(unet.parameters())
                 
-            # 更新步数和进度条
+            # 更新步数
             if accelerator.sync_gradients:
                 global_step += 1
                 
-                # 更新进度条，仅显示最基本的信息
-                epoch_progress_bar.update(1)
-                epoch_progress_bar.set_postfix(
-                    loss=f"{loss.detach().item():.4f}",
-                    lr=f"{lr_scheduler.get_last_lr()[0]:.6f}"
-                )
+                # 每隔一定步数显示一次进度
+                if accelerator.is_local_main_process and global_step % 10 == 0:
+                    # 计算当前进度百分比
+                    progress = step / len(train_dataloader) * 100
+                    current_loss = loss.detach().item()
+                    current_lr = lr_scheduler.get_last_lr()[0]
+                    
+                    # 使用\r来更新同一行
+                    print(f"\r轮次 {epoch+1}/{args.num_train_epochs} "
+                          f"[{progress:.0f}%] "
+                          f"step {step}/{len(train_dataloader)} "
+                          f"loss={current_loss:.4f} "
+                          f"lr={current_lr:.6f}", end="")
                 
-                # 静默记录日志到tensorboard等，但不打印
+                # 静默记录日志
                 accelerator.log({
                     "loss": loss.detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0],
@@ -730,36 +726,24 @@ def main():
                             sys.stdout = original_stdout
                         
                         # 简短通知
-                        progress_bar.write(f"保存检查点到 {save_path}")
-                        
-                        # 删除旧检查点
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = [d for d in os.listdir(args.output_dir) if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-                            
-                            if len(checkpoints) > args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit
-                                for old_ckpt in checkpoints[:num_to_remove]:
-                                    old_ckpt_path = os.path.join(args.output_dir, old_ckpt)
-                                    shutil.rmtree(old_ckpt_path)
-        
-        # 关闭epoch进度条
-        epoch_progress_bar.close()
+                        if accelerator.is_local_main_process:
+                            print(f"\n保存检查点到 {save_path}")
         
         # 计算平均损失
         avg_loss = epoch_loss / epoch_step if epoch_step > 0 else 0
+        end_time = time.time()
         
         # 在每个epoch结束时输出详细信息
         if accelerator.is_local_main_process:
-            current_lr = lr_scheduler.get_last_lr()[0]
-            progress_bar.write(f"轮次 {epoch+1}/{args.num_train_epochs} 完成 | "
-                              f"平均损失: {avg_loss:.4f} | "
-                              f"学习率: {current_lr:.6f} | "
-                              f"步数: {global_step}")
-        
-        # 更新主进度条
-        progress_bar.update(1)
-        progress_bar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr_scheduler.get_last_lr()[0]:.6f}")
+            elapsed_time = end_time - start_time
+            hours, rem = divmod(elapsed_time, 3600)
+            minutes, seconds = divmod(rem, 60)
+            
+            print(f"\n轮次 {epoch+1}/{args.num_train_epochs} 完成 | "
+                  f"用时: {int(hours):02d}:{int(minutes):02d}:{seconds:05.2f} | "
+                  f"平均损失: {avg_loss:.4f} | "
+                  f"学习率: {lr_scheduler.get_last_lr()[0]:.6f} | "
+                  f"步数: {global_step}")
         
         # 每轮结束时清理缓存
         if torch.cuda.is_available():
@@ -778,7 +762,7 @@ def main():
                 
                 # 保存条件UNet模型 - 修改为分别保存组件
                 # logger.info(f"保存模型到 {args.output_dir}")
-                progress_bar.write(f"保存模型到 {args.output_dir}")
+                print(f"保存模型到 {args.output_dir}")
                 
                 # 清理旧的模型文件
                 model_files = ["model_index.json", "scheduler", "unet", "vae"]
@@ -826,7 +810,8 @@ def main():
         
         # 保存条件UNet模型 - 修改为分别保存组件
         # logger.info(f"保存最终模型到 {args.output_dir}")
-        progress_bar.write(f"保存最终模型到 {args.output_dir}")
+        # progress_bar.write(f"保存最终模型到 {args.output_dir}") # 移除tqdm更新
+        print(f"保存最终模型到 {args.output_dir}")
         
         # 清理旧的模型文件
         model_files = ["model_index.json", "scheduler", "unet", "vae"]
