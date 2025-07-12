@@ -1,5 +1,4 @@
 from src.cond_pipeline import CondLatentDiffusionPipeline
-from src.cond_unet import CondUNet2DModel
 from diffusers import UNet2DModel
 import torch
 import os
@@ -70,22 +69,21 @@ try:
     scheduler = DDPMScheduler.from_pretrained(os.path.join(model_id, "scheduler"))
     
     print("加载条件UNet模型...")
-    # 直接使用CondUNet2DModel的from_pretrained方法加载整个条件UNet
-    # 这个方法会正确处理嵌套结构的unet目录
-    cond_unet = CondUNet2DModel.from_pretrained(os.path.join(model_id, "unet"))
+    # 直接使用UNet2DModel的from_pretrained方法加载整个UNet
+    unet = UNet2DModel.from_pretrained(os.path.join(model_id, "unet"))
     
     # 创建条件Pipeline
     print("创建条件Pipeline...")
     pipeline = CondLatentDiffusionPipeline(
         vae=vae,
         scheduler=scheduler,
-        unet=cond_unet
+        unet=unet
     )
 
     # 移动模型到设备
     print(f"将模型移动到设备 {device}...")
     vae = vae.to(device)
-    cond_unet = cond_unet.to(device)
+    unet = unet.to(device)
     pipeline = pipeline.to(device)
     
     load_time = time.time() - start_time
@@ -106,13 +104,13 @@ if gpu_count > 1:
         
         # 为第二个GPU加载条件UNet
         print("为第二个GPU加载条件UNet模型...")
-        cond_unet2 = CondUNet2DModel.from_pretrained(os.path.join(model_id, "unet"))
+        unet2 = UNet2DModel.from_pretrained(os.path.join(model_id, "unet"))
         
         print("为第二个GPU创建Pipeline...")
         pipeline2 = CondLatentDiffusionPipeline(
             vae=VQModel.from_pretrained(os.path.join(model_id, "vae")),  # 创建新的VAE实例
             scheduler=scheduler,  # 调度器不需要移动到GPU
-            unet=cond_unet2
+            unet=unet2
         )
         
         # 将组件移动到第二个GPU
