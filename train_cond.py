@@ -323,7 +323,8 @@ class MicroDopplerDataset(torch.utils.data.Dataset):
         image_path = self.image_paths[idx]
         user_id = self.user_ids[idx]
         
-        image = transforms.ToPILImage()(np.array(transforms.ToTensor()(transforms.Image.open(image_path))))
+        from PIL import Image
+        image = Image.open(image_path).convert("RGB")
         
         if self._transform is not None:
             image = self._transform(image)
