@@ -19,12 +19,14 @@ parser.add_argument('--batch_size', type=int, default=8,
                     help='批量生成数量')
 parser.add_argument('--steps', type=int, default=1000,
                     help='扩散步数')
-parser.add_argument('--guidance_scale', type=float, default=3.0,
-                    help='条件引导强度，越高生成越符合条件，但多样性降低')
+parser.add_argument('--guidance_scale', type=float, default=7.5,
+                    help='条件引导强度，越高生成越符合条件，但多样性降低（推荐值：7.5-15.0）')
 parser.add_argument('--output_dir', type=str, default="generated_images",
                     help='输出目录')
 parser.add_argument('--seed', type=int, default=42,
                     help='随机种子')
+parser.add_argument('--validate_conditions', action='store_true',
+                    help='开启条件验证模式，为多个用户ID生成相同种子的图像以比较效果')
 args = parser.parse_args()
 
 # 检测可用GPU
@@ -253,3 +255,49 @@ if use_dual_pipeline:
     print(f"总生成时间: {generation_time:.2f}秒")
     print(f"平均每张图像时间: {generation_time/batch_size:.2f}秒")
     print(f"每GPU每秒生成图像数: {batch_size / generation_time / 2:.2f}")
+
+# 条件验证模式：为多个用户ID生成相同种子的图像
+if args.validate_conditions:
+    print("\n开始条件验证模式：为多个用户ID生成相同种子的图像以比较效果...")
+    
+    # 选择一些用户ID进行比较（比如1、5、10、15、20）
+    compare_user_ids = [1, 5, 10, 15, 20]
+    compare_output_dir = os.path.join(output_dir, "condition_comparison")
+    os.makedirs(compare_output_dir, exist_ok=True)
+    
+    # 使用较小的批次大小和更少的步数以加快验证过程
+    validation_batch_size = 4
+    validation_steps = min(args.steps, 500)
+    
+    # 使用固定种子，确保可比性
+    validation_seed = 1234
+    validation_generator = torch.Generator(device=device).manual_seed(validation_seed)
+    
+    # 创建比较网格的图像列表
+    comparison_images = []
+    
+    for user_id in compare_user_ids:
+        print(f"\n生成用户ID_{user_id}的验证图像...")
+        model_user_id = user_id - 1  # 转换为模型内部ID
+        user_ids = torch.tensor([model_user_id] * validation_batch_size, device=device)
+        
+        # 生成图像
+        images = pipeline(
+            batch_size=validation_batch_size,
+            num_inference_steps=validation_steps,
+            generator=validation_generator,
+            user_ids=user_ids,
+            guidance_scale=args.guidance_scale
+        ).images
+        
+        # 保存第一张图像用于比较
+        if images:
+            comparison_images.append(images[0])
+            images[0].save(os.path.join(compare_output_dir, f"ID_{user_id}_comparison.png"))
+    
+    # 创建比较网格
+    if len(comparison_images) > 1:
+        comparison_grid = create_image_grid(comparison_images, 1, len(comparison_images))
+        comparison_grid.save(os.path.join(compare_output_dir, f"user_id_comparison_grid.png"))
+        print(f"\n创建用户ID比较网格图像: {os.path.join(compare_output_dir, 'user_id_comparison_grid.png')}")
+        print("请查看比较图像以评估条件控制效果")
