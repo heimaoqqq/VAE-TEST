@@ -176,7 +176,7 @@ def parse_args():
         "--uncond_prob",
         type=float,
         default=0.1,
-        help="无条件训练概率，模型学习在没有用户ID时也能生成图像",
+        help="无条件训练概率，模型学习在没有用户ID时也能生成图像（推荐值：0.1-0.2）",
     )
     parser.add_argument(
         "--mixed_precision",
