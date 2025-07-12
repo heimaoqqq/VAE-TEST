@@ -18,6 +18,8 @@ class FiLMLayer(nn.Module):
             nn.SiLU(),
             nn.Linear(out_channels * 2, out_channels * 2)
         )
+        # 初始化为单位变换（gamma=1，beta=0）
+        self.scale_factor = 3.0  # 增加条件影响的尺度因子
         
     def forward(self, feature_map, condition_embed):
         """
@@ -25,9 +27,14 @@ class FiLMLayer(nn.Module):
             feature_map: 形状为 [batch_size, channels, height, width] 的特征图
             condition_embed: 形状为 [batch_size, embed_dim] 的条件嵌入
         """
+        batch_size = feature_map.shape[0]
+        
         # 生成gamma(scale)和beta(shift)参数
         film_params = self.film_proj(condition_embed)  # [batch_size, out_channels*2]
         scale, shift = torch.chunk(film_params, 2, dim=1)  # 各自 [batch_size, out_channels]
+        
+        # 应用激活函数和缩放，增强条件的影响
+        scale = torch.sigmoid(scale) * self.scale_factor  # 将范围从[0,1]映射到[0,scale_factor]
         
         # 调整维度以便于广播
         scale = scale.unsqueeze(-1).unsqueeze(-1)  # [batch_size, out_channels, 1, 1]
