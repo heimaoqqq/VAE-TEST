@@ -182,9 +182,10 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
             
             # 条件生成
             if guidance_scale > 1.0 and user_ids is not None:
-                # 运行无条件前向传播
+                # 运行无条件前向传播 - 使用-1作为无条件标记
                 with torch.no_grad():
-                    noise_pred_uncond = self.unet(latents, t_tensor, user_ids=None).sample
+                    uncond_ids = torch.full_like(user_ids, -1)
+                    noise_pred_uncond = self.unet(latents, t_tensor, user_ids=uncond_ids).sample
                     
                 # 运行条件前向传播
                 noise_pred_cond = self.unet(latents, t_tensor, user_ids=user_ids).sample
