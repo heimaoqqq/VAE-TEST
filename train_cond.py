@@ -377,7 +377,6 @@ def main():
             "UpBlock2D", "AttnUpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D", "UpBlock2D"
         ),
         num_class_embeds=args.num_users + 1,  # +1 用于无条件生成
-        class_embed_type="identity",  # 类别ID直接作为嵌入索引
     )
 
     # 冻结VAE
