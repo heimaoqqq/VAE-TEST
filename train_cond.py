@@ -581,7 +581,7 @@ def main():
                 batch_size = clean_images.shape[0]
                 uncond_mask = torch.rand(batch_size, device=accelerator.device) < args.uncond_prob
                 if uncond_mask.any():
-                    # 对于标记为无条件的样本，将user_ids设为None
+                    # 对于标记为无条件的样本，将user_ids设为-1
                     user_ids_with_uncond = user_ids.clone()
                     user_ids_with_uncond[uncond_mask] = -1  # 使用-1表示无条件
                     user_ids = user_ids_with_uncond
