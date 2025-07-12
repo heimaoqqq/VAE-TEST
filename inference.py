@@ -78,7 +78,17 @@ try:
         vae=vae,
         scheduler=scheduler,
         unet=cond_unet
-    ).to(device)
+    )
+
+    # 首先将VAE移动到设备
+    print(f"将模型移动到设备 {device}...")
+    vae = vae.to(device)
+    
+    # 然后将UNet移动到设备
+    cond_unet = cond_unet.to(device)
+    
+    # 最后将整个pipeline移动到设备
+    pipeline = pipeline.to(device)
     
     load_time = time.time() - start_time
     print(f"模型加载成功！耗时 {load_time:.2f} 秒")
@@ -102,10 +112,16 @@ if gpu_count > 1:
         
         print("为第二个GPU创建Pipeline...")
         pipeline2 = CondLatentDiffusionPipeline(
-            vae=vae.to(second_device),  # 重用VAE但移动到第二个GPU
+            vae=VQModel.from_pretrained(os.path.join(model_id, "vae")),  # 创建新的VAE实例
             scheduler=scheduler,  # 调度器不需要移动到GPU
-            unet=cond_unet2.to(second_device)
+            unet=cond_unet2
         )
+        
+        # 将组件移动到第二个GPU
+        print(f"将模型移动到设备 {second_device}...")
+        pipeline2.vae = pipeline2.vae.to(second_device)
+        pipeline2.unet = pipeline2.unet.to(second_device)
+        pipeline2 = pipeline2.to(second_device)
         
         print(f"第二个模型实例加载成功！")
         use_dual_pipeline = True
