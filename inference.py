@@ -58,13 +58,30 @@ try:
     print(f"正在从 {model_id} 加载模型组件...")
     start_time = time.time()
     
-    # 直接加载条件模型，而不是先加载无条件模型
-    pipeline = CondLatentDiffusionPipeline.from_pretrained(model_id).to(device)
+    # 手动加载各个组件
+    from diffusers import DDPMScheduler, VQModel
     
-    # 获取组件以便后续可能的双GPU使用
-    vae = pipeline.vae
-    scheduler = pipeline.scheduler
-    cond_unet = pipeline.unet
+    print("加载VAE模型...")
+    vae = VQModel.from_pretrained(model_id, subfolder="vae")
+    
+    print("加载调度器...")
+    scheduler = DDPMScheduler.from_pretrained(model_id, subfolder="scheduler")
+    
+    print("加载UNet模型...")
+    # 先加载基础UNet模型
+    base_unet = UNet2DModel.from_pretrained(model_id, subfolder="unet")
+    
+    # 创建条件UNet封装
+    print("创建条件UNet模型...")
+    cond_unet = CondUNet2DModel(base_unet=base_unet, num_users=31, user_embed_dim=64)
+    
+    # 创建条件Pipeline
+    print("创建条件Pipeline...")
+    pipeline = CondLatentDiffusionPipeline(
+        vae=vae,
+        scheduler=scheduler,
+        unet=cond_unet
+    ).to(device)
     
     load_time = time.time() - start_time
     print(f"模型加载成功！耗时 {load_time:.2f} 秒")
@@ -80,8 +97,19 @@ if gpu_count > 1:
         print(f"正在为第二个GPU加载模型...")
         second_device = f"cuda:1"
         
-        # 直接加载第二个条件模型到第二个GPU
-        pipeline2 = CondLatentDiffusionPipeline.from_pretrained(model_id).to(second_device)
+        # 手动加载第二个GPU上的组件
+        print("为第二个GPU加载UNet模型...")
+        base_unet2 = UNet2DModel.from_pretrained(model_id, subfolder="unet")
+        
+        print("为第二个GPU创建条件UNet...")
+        cond_unet2 = CondUNet2DModel(base_unet=base_unet2, num_users=31, user_embed_dim=64)
+        
+        print("为第二个GPU创建Pipeline...")
+        pipeline2 = CondLatentDiffusionPipeline(
+            vae=vae.to(second_device),  # 重用VAE但移动到第二个GPU
+            scheduler=scheduler,  # 调度器不需要移动到GPU
+            unet=cond_unet2.to(second_device)
+        )
         
         print(f"第二个模型实例加载成功！")
         use_dual_pipeline = True
