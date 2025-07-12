@@ -439,8 +439,9 @@ def main():
             # logger.info("检测到PyTorch 2.0+，尝试使用torch.compile优化模型")
             # 使用最安全的模式，或者完全禁用
             # unet = torch.compile(unet, mode="reduce-overhead")
-            # logger.info("由于索引操作兼容性问题，跳过torch.compile优化")
+            logger.warning("由于索引操作兼容性问题，跳过torch.compile优化")
             # 不应用torch.compile，以避免索引操作的问题
+            pass
     except Exception as e:
         # logger.warning(f"torch.compile优化失败: {e}，跳过优化")
         pass
