@@ -325,11 +325,18 @@ def main():
         project_dir=args.output_dir, logging_dir=logging_dir
     )
     
+    # 添加优化选项
+    kwargs = {}
+    if torch.__version__ >= "2.0.0":
+        # 如果PyTorch版本支持，添加更多优化选项
+        kwargs["gradient_accumulation_plugin"] = "ddp_find_unused_parameters_false"
+    
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
+        **kwargs
     )
     
     # 创建日志器
@@ -342,9 +349,9 @@ def main():
     if accelerator.is_local_main_process:
         logger.setLevel(logging.INFO)
     else:
-        logger.setLevel(logging.WARNING)
+        logger.setLevel(logging.ERROR)  # 非主进程只显示错误信息
         
-    logger.info(accelerator.state, main_process_only=False)
+    logger.info(accelerator.state, main_process_only=True)  # 只在主进程显示
     
     # 设置随机种子
     if args.seed is not None:
@@ -423,6 +430,14 @@ def main():
         freeze_unet=False  # 不冻结基础UNet，让整个网络一起训练
     )
     
+    # 如果PyTorch版本支持，使用torch.compile加速模型
+    if hasattr(torch, 'compile') and torch.__version__ >= "2.0.0":
+        logger.info("使用torch.compile优化模型")
+        try:
+            unet = torch.compile(unet)
+        except Exception as e:
+            logger.warning(f"torch.compile优化失败: {e}")
+    
     # 设置调度器
     noise_scheduler = scheduler
     
@@ -434,12 +449,20 @@ def main():
         is_main_process=accelerator.is_main_process,
     )
     
+    # 确定最佳的num_workers数量
+    import multiprocessing
+    num_cpus = multiprocessing.cpu_count()
+    num_workers = min(8, num_cpus - 1)  # 留一个CPU核心给系统
+    logger.info(f"数据加载器使用 {num_workers} 个工作进程")
+    
     # 创建数据加载器
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=num_workers,
+        pin_memory=True,  # 使用pin_memory加速数据传输
+        drop_last=True,  # 丢弃不完整的批次，避免批次大小不一致
     )
     
     # 计算训练步数 - 在创建优化器和学习率调度器之前
@@ -579,6 +602,9 @@ def main():
             
             logger.info(f"从步骤 {global_step} (轮次 {resume_epoch}, 步骤 {resume_step}) 恢复训练")
     
+    # 启用性能分析
+    torch.cuda.empty_cache()  # 清空缓存，确保有足够的GPU内存
+    
     # 训练循环
     for epoch in range(args.num_train_epochs):
         unet.train()
@@ -587,7 +613,8 @@ def main():
                                   disable=not accelerator.is_local_main_process,
                                   dynamic_ncols=True,  # 动态调整宽度
                                   leave=False,  # 不保留进度条，只显示当前轮次
-                                  position=0)   # 固定位置
+                                  position=0,   # 固定位置
+                                  mininterval=0.5)  # 减少更新频率，提高性能
         epoch_progress_bar.set_description(f"轮次 {epoch+1}/{args.num_train_epochs}")
         
         # 记录每个轮次的平均损失
@@ -596,13 +623,13 @@ def main():
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
                 # 转换为潜在表示
-                clean_images = batch["input"].to(weight_dtype)
-                latents = vae.encode(clean_images).latents
-                latents = latents.to(dtype=weight_dtype)
-                latents = latents * 0.18215
+                clean_images = batch["input"].to(accelerator.device, non_blocking=True)
+                with torch.no_grad():
+                    latents = vae.encode(clean_images).latents
+                    latents = latents * 0.18215
                 
                 # 获取用户ID
-                user_ids = batch["user_id"].to(accelerator.device)
+                user_ids = batch["user_id"].to(accelerator.device, non_blocking=True)
                 
                 # 随机丢弃部分条件（对无条件生成能力建模）
                 batch_size = clean_images.shape[0]
@@ -638,7 +665,7 @@ def main():
                     accelerator.clip_grad_norm_(unet.parameters(), 1.0)
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)  # 使用set_to_none=True减少内存使用
                 
                 # 累积损失
                 epoch_loss += loss.detach().item()
@@ -672,13 +699,17 @@ def main():
                                     epoch_progress_bar.write(f"删除旧检查点 {old_ckpt_path}")
                 
             # 更新内部进度条，显示当前步骤和损失
-            current_loss = loss.detach().item()
-            current_lr = lr_scheduler.get_last_lr()[0]
-            epoch_progress_bar.set_postfix(
-                loss=f"{current_loss:.4f}",
-                lr=f"{current_lr:.6f}"
-            )
-            epoch_progress_bar.update(1)
+            if step % 5 == 0:  # 减少进度条更新频率
+                current_loss = loss.detach().item()
+                current_lr = lr_scheduler.get_last_lr()[0]
+                epoch_progress_bar.set_postfix(
+                    loss=f"{current_loss:.4f}",
+                    lr=f"{current_lr:.6f}"
+                )
+                epoch_progress_bar.update(min(5, len(train_dataloader) - epoch_progress_bar.n))
+            
+        # 确保进度条完成
+        epoch_progress_bar.update(len(train_dataloader) - epoch_progress_bar.n)
         
         # 计算平均损失
         avg_loss = epoch_loss / len(train_dataloader)
@@ -693,6 +724,10 @@ def main():
         )
         progress_bar.update(1)
         
+        # 每轮结束时清理缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         # 保存模型
         if accelerator.is_main_process:
             if epoch % args.save_model_epochs == 0 or epoch == args.num_train_epochs - 1:
