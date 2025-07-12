@@ -747,10 +747,54 @@ def main():
                         guidance_scale=3.0,  # 使用条件引导
                     ).images
                     
+                    # 打印调试信息
+                    print(f"生成的图像形状: {images.shape}, 类型: {images.dtype}")
+                    
                     # 保存图像
                     images_processed = (images * 255).round().astype("uint8")
                     for i, image in enumerate(images_processed):
-                        image_pil = transforms.ToPILImage()(image.transpose(2, 0, 1)/255.0)
+                        # 打印每个图像的形状
+                        print(f"处理图像 {i}, 形状: {image.shape}")
+                        
+                        # 检查图像形状并修复
+                        if len(image.shape) == 3:  # [H, W, C]
+                            if image.shape[2] > 4:  # 通道数过多
+                                print(f"警告: 通道数过多 {image.shape[2]}，裁剪为前3个通道")
+                                # 只保留前3个通道(RGB)
+                                image = image[:, :, :3]
+                            # 确保通道顺序正确 - 对于PIL需要是[H, W, C]格式
+                            image_pil = Image.fromarray(image)
+                        else:
+                            # 如果形状不是预期的[H, W, C]，打印警告并尝试修复
+                            print(f"警告: 图像形状异常 {image.shape}，尝试修复")
+                            if len(image.shape) == 4:  # 可能是[B, C, H, W]或[B, H, W, C]
+                                image = image[0]  # 取第一个样本
+                                print(f"  取第一个样本后形状: {image.shape}")
+                            
+                            # 检查通道维度
+                            if len(image.shape) == 3 and (image.shape[0] == 3 or image.shape[0] == 1):  # 可能是[C, H, W]
+                                print(f"  检测到[C,H,W]格式，转置为[H,W,C]")
+                                image = image.transpose(1, 2, 0)  # 转为[H, W, C]
+                                print(f"  转置后形状: {image.shape}")
+                            
+                            # 确保只有3个通道
+                            if len(image.shape) == 3 and image.shape[2] > 3:
+                                print(f"  裁剪通道从{image.shape[2]}到3")
+                                image = image[:, :, :3]
+                                
+                            try:
+                                image_pil = Image.fromarray(image.astype("uint8"))
+                            except Exception as e:
+                                print(f"转换为PIL图像失败: {e}")
+                                print(f"图像形状: {image.shape}, 类型: {image.dtype}")
+                                print(f"图像值范围: 最小={image.min()}, 最大={image.max()}")
+                                # 尝试规范化并重新转换
+                                if image.max() > 1.0:
+                                    image = image / 255.0
+                                image = (image * 255).clip(0, 255).astype("uint8")
+                                image_pil = Image.fromarray(image)
+                        
+                        # 保存图像
                         image_pil.save(
                             os.path.join(
                                 args.output_dir, 
