@@ -254,7 +254,7 @@ class MicroDopplerDataset(torch.utils.data.Dataset):
         self.center_crop = center_crop
         
         # 设置转换
-        self._transform = transforms.Compose([
+        self.transform = transforms.Compose([
             transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(resolution) if center_crop else transforms.RandomCrop(resolution),
             transforms.ToTensor(),
@@ -301,8 +301,7 @@ class MicroDopplerDataset(torch.utils.data.Dataset):
                 if count > 0:
                     print(f"  - ID_{folder_id} (内部ID: {model_user_id}) 有 {count} 张图像")
         
-        self.num_users = len(self.user_map)
-        print(f"数据加载器初始化完成，共找到 {self.num_users} 个用户")
+        self.num_users = len(set(self.user_ids))
 
     def __len__(self):
         return len(self.image_paths)
