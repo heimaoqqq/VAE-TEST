@@ -576,13 +576,13 @@ def main():
     # 计算每个轮次的更新步数
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     
-    # 设置进度条 - 使用轮次而非总步数
+    # 设置主进度条 - 显示整体训练进度
     progress_bar = tqdm(range(args.num_train_epochs), 
                         disable=not accelerator.is_local_main_process,
                         dynamic_ncols=True,  # 动态调整宽度
                         leave=True,        # 保留进度条
-                        position=0)       # 固定位置
-    progress_bar.set_description("训练轮次")
+                        position=0,       # 固定在首位置
+                        desc="训练轮次")  # 使用desc代替set_description
     
     global_step = 0
     
@@ -638,19 +638,24 @@ def main():
     # 训练循环
     for epoch in range(args.num_train_epochs):
         unet.train()
-        # 为每个轮次创建一个内部进度条
-        epoch_progress_bar = tqdm(total=num_update_steps_per_epoch, 
-                                  disable=not accelerator.is_local_main_process,
-                                  dynamic_ncols=True,  # 动态调整宽度
-                                  leave=False,         # 不保留旧的进度条
-                                  position=1)          # 设置在主进度条下方
-        epoch_progress_bar.set_description(f"轮次 {epoch+1}/{args.num_train_epochs}")
         
-        # 记录每个轮次的平均损失
+        # 使用命名参数而非位置参数来创建进度条
+        epoch_progress_bar = tqdm(
+            total=num_update_steps_per_epoch,
+            disable=not accelerator.is_local_main_process,
+            leave=False,     # 不保留旧的进度条
+            position=1,      # 放在主进度条下方
+            dynamic_ncols=True,
+            desc=f"Epoch {epoch+1}/{args.num_train_epochs}"
+        )
+        
+        # 记录每个轮次的统计信息
         epoch_loss = 0.0
+        epoch_step = 0
         
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
+                # 模型训练代码保持不变，但不输出日志
                 # 转换为潜在表示
                 clean_images = batch["input"].to(accelerator.device, non_blocking=True)
                 with torch.no_grad():
@@ -662,32 +667,19 @@ def main():
                 # 获取用户ID
                 user_ids = batch["user_id"].to(accelerator.device, non_blocking=True)
                 
-                # 随机丢弃部分条件（对无条件生成能力建模）
+                # 随机丢弃部分条件
                 batch_size = clean_images.shape[0]
                 uncond_mask = torch.rand(batch_size, device=accelerator.device) < args.uncond_prob
                 if uncond_mask.any():
-                    # 对于标记为无条件的样本，将user_ids设为-1
                     user_ids_with_uncond = user_ids.clone()
                     user_ids_with_uncond[uncond_mask] = -1  # 使用-1表示无条件
                     user_ids = user_ids_with_uncond
                 
-                # 采样噪声
+                # 训练步骤
                 noise = torch.randn_like(latents)
-                
-                # 采样时间步
-                timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps, 
-                    (batch_size,), 
-                    device=latents.device
-                ).long()
-                
-                # 添加噪声
+                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=latents.device).long()
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                
-                # 预测噪声
                 model_pred = unet(noisy_latents, timesteps, user_ids=user_ids).sample
-                
-                # 计算损失
                 loss = F.mse_loss(model_pred, noise, reduction="mean")
                 
                 # 反向传播
@@ -696,49 +688,48 @@ def main():
                     accelerator.clip_grad_norm_(unet.parameters(), 1.0)
                 optimizer.step()
                 lr_scheduler.step()
-                optimizer.zero_grad(set_to_none=True)  # 使用set_to_none=True减少内存使用
+                optimizer.zero_grad(set_to_none=True)
                 
-                # 累积损失
+                # 累积损失，用于最终统计
                 epoch_loss += loss.detach().item()
+                epoch_step += 1
                 
             # 更新EMA模型
             if args.use_ema and accelerator.sync_gradients:
                 ema_model.step(unet.parameters())
                 
-            # 更新步数
+            # 更新步数和进度条
             if accelerator.sync_gradients:
                 global_step += 1
                 
-                # 记录详细的日志信息，但减少内容
-                logs = {
-                    "loss": f"{loss.detach().item():.4f}",
-                    "lr": f"{lr_scheduler.get_last_lr()[0]:.6f}"
-                }
-                
-                # 使用accelerator记录日志，不会打断进度条
-                accelerator.log({"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}, step=global_step)
-                
-                # 更新进度条
+                # 更新进度条，仅显示最基本的信息
                 epoch_progress_bar.update(1)
-                epoch_progress_bar.set_postfix(**logs)
+                epoch_progress_bar.set_postfix(
+                    loss=f"{loss.detach().item():.4f}",
+                    lr=f"{lr_scheduler.get_last_lr()[0]:.6f}"
+                )
+                
+                # 静默记录日志到tensorboard等，但不打印
+                accelerator.log({
+                    "loss": loss.detach().item(),
+                    "lr": lr_scheduler.get_last_lr()[0],
+                }, step=global_step)
                 
                 # 保存检查点
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         
-                        # 临时重定向标准输出以抑制详细日志
+                        # 静默保存
                         original_stdout = sys.stdout
                         sys.stdout = open(os.devnull, 'w')
-                        
                         try:
                             accelerator.save_state(save_path)
                         finally:
-                            # 恢复标准输出
                             sys.stdout.close()
                             sys.stdout = original_stdout
-                            
-                        # 使用进度条的write方法输出信息，不会打断进度条
+                        
+                        # 简短通知
                         progress_bar.write(f"保存检查点到 {save_path}")
                         
                         # 删除旧检查点
@@ -751,43 +742,24 @@ def main():
                                 for old_ckpt in checkpoints[:num_to_remove]:
                                     old_ckpt_path = os.path.join(args.output_dir, old_ckpt)
                                     shutil.rmtree(old_ckpt_path)
-                                    progress_bar.write(f"删除旧检查点 {old_ckpt_path}")
-            
-            # 移除在每个步骤更新进度条的代码，避免频繁刷新
-            # if step % 5 == 0:
-            #     current_loss = loss.detach().item()
-            #     current_lr = lr_scheduler.get_last_lr()[0]
-            #     epoch_progress_bar.set_postfix(
-            #         loss=f"{current_loss:.4f}",
-            #         lr=f"{current_lr:.6f}"
-            #     )
-            
-        # 确保进度条完成
-        # 不需要在这里更新进度条，因为我们已经在每个梯度累积步骤中更新了
-        # epoch_progress_bar.update(num_update_steps_per_epoch - epoch_progress_bar.n)
         
-        # 计算平均损失
-        avg_loss = epoch_loss / len(train_dataloader)
-        
-        # 关闭内部进度条
+        # 关闭epoch进度条
         epoch_progress_bar.close()
         
-        # 更新外部进度条，显示平均损失
-        progress_bar.set_postfix(
-            avg_loss=f"{avg_loss:.4f}",
-            last_lr=f"{lr_scheduler.get_last_lr()[0]:.6f}",
-            epoch=f"{epoch+1}/{args.num_train_epochs}"
-        )
-        progress_bar.update(1)
+        # 计算平均损失
+        avg_loss = epoch_loss / epoch_step if epoch_step > 0 else 0
         
-        # 移除在轮次结束时输出详细的摘要信息
-        # if accelerator.is_main_process:
-        #     logger.info(
-        #         f"轮次 {epoch+1}/{args.num_train_epochs} 完成: "
-        #         f"平均损失: {avg_loss:.4f}, "
-        #         f"学习率: {lr_scheduler.get_last_lr()[0]:.6f}, "
-        #         f"全局步数: {global_step}"
-        #     )
+        # 在每个epoch结束时输出详细信息
+        if accelerator.is_local_main_process:
+            current_lr = lr_scheduler.get_last_lr()[0]
+            progress_bar.write(f"轮次 {epoch+1}/{args.num_train_epochs} 完成 | "
+                              f"平均损失: {avg_loss:.4f} | "
+                              f"学习率: {current_lr:.6f} | "
+                              f"步数: {global_step}")
+        
+        # 更新主进度条
+        progress_bar.update(1)
+        progress_bar.set_postfix(loss=f"{avg_loss:.4f}", lr=f"{lr_scheduler.get_last_lr()[0]:.6f}")
         
         # 每轮结束时清理缓存
         if torch.cuda.is_available():
