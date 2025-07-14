@@ -1,5 +1,4 @@
 from src.cond_pipeline import CondLatentDiffusionPipeline
-from src.cond_unet import CondUNet2DModel
 from diffusers import UNet2DModel
 import torch
 import os
@@ -13,14 +12,14 @@ import argparse
 parser = argparse.ArgumentParser(description='条件微多普勒时频图生成')
 parser.add_argument('--model_path', type=str, default="/kaggle/working/VAE",
                     help='模型路径')
-parser.add_argument('--user_id', type=int, default=0,
-                    help='要生成的用户ID（0-30）')
+parser.add_argument('--user_id', type=int, default=1,
+                    help='要生成的用户ID（1-31）对应文件夹ID_1到ID_31')
 parser.add_argument('--batch_size', type=int, default=8,
                     help='批量生成数量')
 parser.add_argument('--steps', type=int, default=1000,
                     help='扩散步数')
-parser.add_argument('--guidance_scale', type=float, default=3.0,
-                    help='条件引导强度，越高生成越符合条件，但多样性降低')
+parser.add_argument('--guidance_scale', type=float, default=7.5,
+                    help='条件引导强度，越高生成越符合条件，但多样性降低（推荐值：7.5-15.0）')
 parser.add_argument('--output_dir', type=str, default="generated_images",
                     help='输出目录')
 parser.add_argument('--seed', type=int, default=42,
@@ -45,39 +44,54 @@ if not os.path.exists(model_id):
     print("请确保已经训练并保存了模型，或者修改model_id为正确的路径。")
     exit(1)
 
+# 检查用户ID是否在有效范围内
+if args.user_id < 1 or args.user_id > 31:
+    print(f"错误：用户ID必须在1到31之间，当前值为{args.user_id}")
+    exit(1)
+
+# 将文件夹ID转换为模型内部ID（从0开始）
+model_user_id = args.user_id - 1
+print(f"生成用户ID_{args.user_id}的图像（模型内部ID: {model_user_id}）")
+
 try:
     print(f"正在从 {model_id} 加载模型组件...")
     start_time = time.time()
     
-    # 先加载无条件模型以获取基本组件
-    from src.pipeline import UncondLatentDiffusionPipeline
-    temp_pipeline = UncondLatentDiffusionPipeline.from_pretrained(model_id)
+    # 手动加载各个组件并检查不同可能的路径
+    from diffusers import DDPMScheduler, VQModel
     
-    # 提取组件
-    vae = temp_pipeline.vae
-    scheduler = temp_pipeline.scheduler
-    base_unet = temp_pipeline.unet
+    # 使用fp16加载模型以加速并减少显存占用
+    torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
     
-    # 释放临时pipeline
-    del temp_pipeline
-    torch.cuda.empty_cache()
-    
-    # 创建条件UNet
-    print("创建条件UNet模型...")
-    cond_unet = CondUNet2DModel(base_unet=base_unet, num_users=31, user_embed_dim=64)
+    print("加载VAE模型...")
+    # 修正：我们的pipeline将vae保存在'vqvae'子目录下
+    vae = VQModel.from_pretrained(os.path.join(model_id, "vqvae"), torch_dtype=torch_dtype)
+    print("VAE模型加载成功。")
+
+    print("加载条件UNet模型...")
+    # 直接使用UNet2DModel的from_pretrained方法加载整个UNet
+    unet = UNet2DModel.from_pretrained(os.path.join(model_id, "unet"), torch_dtype=torch_dtype)
     
     # 创建条件Pipeline
     print("创建条件Pipeline...")
     pipeline = CondLatentDiffusionPipeline(
-        vae=vae,
-        scheduler=scheduler,
-        unet=cond_unet
-    ).to(device)
+        vqvae=vae,
+        scheduler=DDPMScheduler.from_pretrained(os.path.join(model_id, "scheduler")),
+        unet=unet
+    )
+
+    # 移动模型到设备
+    print(f"将模型移动到设备 {device}...")
+    vae = vae.to(device)
+    unet = unet.to(device)
+    pipeline = pipeline.to(device)
     
     load_time = time.time() - start_time
     print(f"模型加载成功！耗时 {load_time:.2f} 秒")
 except Exception as e:
     print(f"加载模型时出错: {e}")
+    import traceback
+    traceback.print_exc()
     print("请检查模型路径和文件是否完整。")
     exit(1)
 
@@ -87,21 +101,28 @@ if gpu_count > 1:
         # 尝试创建第二个模型实例到第二个GPU
         print(f"正在为第二个GPU加载模型...")
         second_device = f"cuda:1"
-        # 为第二个GPU创建条件UNet
-        cond_unet2 = CondUNet2DModel(
-            base_unet=UNet2DModel.from_pretrained(model_id, subfolder="unet"),  # 重新加载基础UNet
-            num_users=31, 
-            user_embed_dim=64
-        )
+        
+        # 为第二个GPU加载条件UNet
+        print("为第二个GPU加载条件UNet模型...")
+        unet2 = UNet2DModel.from_pretrained(os.path.join(model_id, "unet"), torch_dtype=torch_dtype)
+        
+        print("为第二个GPU创建Pipeline...")
         pipeline2 = CondLatentDiffusionPipeline(
-            vae=vae.to(second_device),  # 重用VAE但移动到第二个GPU
-            scheduler=scheduler,  # 调度器不需要移动到GPU
-            unet=cond_unet2.to(second_device)
+            vqvae=VQModel.from_pretrained(os.path.join(model_id, "vqvae"), torch_dtype=torch_dtype),
+            scheduler=DDPMScheduler.from_pretrained(os.path.join(model_id, "scheduler")),
+            unet=unet2
         )
+        # 手动将组件移动到第二个设备
+        pipeline2.vqvae = pipeline2.vqvae.to(second_device)
+        pipeline2.unet = pipeline2.unet.to(second_device)
+        pipeline2 = pipeline2.to(second_device)
+        
         print(f"第二个模型实例加载成功！")
         use_dual_pipeline = True
     except Exception as e:
         print(f"无法加载第二个模型实例: {e}")
+        import traceback
+        traceback.print_exc()
         print("将仅使用单个GPU")
         use_dual_pipeline = False
 else:
@@ -118,7 +139,6 @@ else:
 
 num_inference_steps = args.steps  # 推理步数
 output_dir = args.output_dir  # 输出目录
-user_id = args.user_id  # 用户ID
 guidance_scale = args.guidance_scale  # 条件引导强度
 
 # 创建输出目录
@@ -133,24 +153,25 @@ if use_dual_pipeline:
 
 # 双GPU并行生成函数
 def generate_on_gpu(pipeline, batch_size, num_steps, user_id, generator, guidance_scale, device_idx, results):
-    print(f"GPU {device_idx} 开始生成用户{user_id}的 {batch_size} 张图像...")
+    print(f"GPU {device_idx} 开始生成用户ID_{args.user_id}的 {batch_size} 张图像...")
     start_time = time.time()
     # 创建用户ID张量
     user_ids = torch.tensor([user_id] * batch_size, device=f"cuda:{device_idx}")
     
-    images = pipeline(
-        batch_size=batch_size,
-        num_inference_steps=num_steps,
-        generator=generator,
-        user_ids=user_ids,
-        guidance_scale=guidance_scale  # 添加条件引导强度
-    ).images
+    with torch.autocast("cuda"):
+        images = pipeline(
+            batch_size=batch_size,
+            num_inference_steps=num_steps,
+            generator=generator,
+            user_ids=user_ids,
+            guidance_scale=guidance_scale  # 添加条件引导强度
+        ).images
     generation_time = time.time() - start_time
     print(f"GPU {device_idx} 完成！耗时 {generation_time:.2f} 秒")
     results[device_idx] = images
 
 # 生成微多普勒时频图像
-print(f"开始生成用户{user_id}的 {batch_size} 张图像，使用 {num_inference_steps} 步推理...")
+print(f"开始生成用户ID_{args.user_id}的 {batch_size} 张图像，使用 {num_inference_steps} 步推理...")
 start_time = time.time()
 
 if use_dual_pipeline:
@@ -159,9 +180,9 @@ if use_dual_pipeline:
     
     # 创建线程
     t1 = threading.Thread(target=generate_on_gpu, 
-                          args=(pipeline, per_gpu_batch, num_inference_steps, user_id, generator1, guidance_scale, 0, results))
+                          args=(pipeline, per_gpu_batch, num_inference_steps, model_user_id, generator1, guidance_scale, 0, results))
     t2 = threading.Thread(target=generate_on_gpu, 
-                          args=(pipeline2, per_gpu_batch, num_inference_steps, user_id, generator2, guidance_scale, 1, results))
+                          args=(pipeline2, per_gpu_batch, num_inference_steps, model_user_id, generator2, guidance_scale, 1, results))
     
     # 启动线程
     t1.start()
@@ -179,27 +200,31 @@ if use_dual_pipeline:
 else:
     # 单GPU处理
     # 创建用户ID张量
-    user_ids = torch.tensor([user_id] * batch_size, device=device)
+    user_ids = torch.tensor([model_user_id] * batch_size, device=device)
     
-    images = pipeline(
-        batch_size=batch_size,
-        num_inference_steps=num_inference_steps,
-        generator=generator1,
-        user_ids=user_ids,
-        guidance_scale=guidance_scale  # 添加条件引导强度
-    ).images
+    with torch.autocast("cuda"):
+        images = pipeline(
+            batch_size=batch_size,
+            num_inference_steps=num_inference_steps,
+            generator=generator1,
+            user_ids=user_ids,
+            guidance_scale=guidance_scale  # 添加条件引导强度
+        ).images
 
 generation_time = time.time() - start_time
 print(f"图像生成完成！总耗时 {generation_time:.2f} 秒，平均每张 {generation_time/batch_size:.2f} 秒")
 
 # 保存生成的图像
 for i, image in enumerate(images):
-    image.save(os.path.join(output_dir, f"user_{user_id}_microdoppler_{i:03d}.png"))
+    image.save(os.path.join(output_dir, f"ID_{args.user_id}_microdoppler_{i:03d}.png"))
 
-print(f"成功生成 {len(images)} 张用户{user_id}的微多普勒时频图像，保存在 {output_dir} 目录")
+print(f"成功生成 {len(images)} 张用户ID_{args.user_id}的微多普勒时频图像，保存在 {output_dir} 目录")
 
 # 可选：创建一个包含所有图像的网格展示图
 def create_image_grid(images, rows, cols):
+    if not images:
+        print("警告：没有生成图像，跳过网格创建")
+        return None
     w, h = images[0].size
     grid = Image.new('RGB', size=(cols*w, rows*h))
     for i, image in enumerate(images):
@@ -207,11 +232,17 @@ def create_image_grid(images, rows, cols):
     return grid
 
 # 创建网格图像
-rows = int(np.sqrt(len(images)))
-cols = len(images) // rows + (1 if len(images) % rows != 0 else 0)
-grid = create_image_grid(images, rows, cols)
-grid.save(os.path.join(output_dir, f"user_{user_id}_microdoppler_grid.png"))
-print(f"创建网格展示图：{os.path.join(output_dir, f'user_{user_id}_microdoppler_grid.png')}")
+if images:
+    rows = int(np.sqrt(len(images)))
+    if rows == 0:  # 防止除零错误
+        rows = 1
+    cols = len(images) // rows + (1 if len(images) % rows != 0 else 0)
+    grid = create_image_grid(images, rows, cols)
+    if grid:
+        grid.save(os.path.join(output_dir, f"ID_{args.user_id}_microdoppler_grid.png"))
+        print(f"创建网格展示图：{os.path.join(output_dir, f'ID_{args.user_id}_microdoppler_grid.png')}")
+else:
+    print("没有生成任何图像，跳过创建网格图像")
 
 # 性能统计
 if use_dual_pipeline:

@@ -69,6 +69,10 @@ def preprocess_microdoppler_data(data_dir, output_dir, image_size=256, max_sampl
         image_size: 目标图像尺寸
         max_samples: 最大样本数量，None表示处理所有样本
     """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
     
     # 图像转换
@@ -78,48 +82,76 @@ def preprocess_microdoppler_data(data_dir, output_dir, image_size=256, max_sampl
         transforms.Normalize([0.5], [0.5]),
     ])
     
+    # 检查数据目录是否存在
+    if not os.path.exists(data_dir):
+        logger.error(f"数据目录 {data_dir} 不存在")
+        return
+        
     # 遍历所有用户目录
-    user_dirs = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
-    processed_count = 0
-    
-    for user_dir in tqdm(user_dirs, desc="处理用户数据"):
-        user_path = os.path.join(data_dir, user_dir)
-        output_user_path = os.path.join(output_dir, user_dir)
-        os.makedirs(output_user_path, exist_ok=True)
-        
-        # 获取所有图像文件
-        image_files = [f for f in os.listdir(user_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        
-        for img_file in image_files:
-            if max_samples is not None and processed_count >= max_samples:
-                print(f"已达到最大样本数 {max_samples}，停止处理")
-                return
+    try:
+        user_dirs = [d for d in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, d))]
+        if not user_dirs:
+            logger.warning(f"在 {data_dir} 中未找到子目录，尝试处理根目录中的图像")
+            # 如果没有子目录，则将根目录视为单个用户目录
+            user_dirs = ["default"]
             
-            img_path = os.path.join(user_path, img_file)
-            output_img_path = os.path.join(output_user_path, img_file)
+        processed_count = 0
+        
+        for user_dir in tqdm(user_dirs, desc="处理用户数据"):
+            # 处理默认情况
+            if user_dir == "default":
+                user_path = data_dir
+            else:
+                user_path = os.path.join(data_dir, user_dir)
+                
+            output_user_path = os.path.join(output_dir, user_dir)
+            os.makedirs(output_user_path, exist_ok=True)
             
-            try:
-                # 读取图像
-                img = Image.open(img_path)
+            # 获取所有图像文件
+            image_files = [f for f in os.listdir(user_path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+            
+            if not image_files:
+                logger.warning(f"在 {user_path} 中未找到图像文件")
+                continue
                 
-                # 确保图像是RGB格式
-                if img.mode != 'RGB':
-                    img = img.convert('RGB')
+            for img_file in image_files:
+                if max_samples is not None and processed_count >= max_samples:
+                    logger.info(f"已达到最大样本数 {max_samples}，停止处理")
+                    return
                 
-                # 应用转换
-                processed_img = transform(img)
+                img_path = os.path.join(user_path, img_file)
+                output_img_path = os.path.join(output_user_path, img_file)
                 
-                # 转回PIL图像并保存
-                processed_img = ((processed_img + 1.0) * 127.5).clamp(0, 255).permute(1, 2, 0).numpy().astype(np.uint8)
-                processed_img = Image.fromarray(processed_img)
-                processed_img.save(output_img_path)
-                
-                processed_count += 1
-                
-            except Exception as e:
-                print(f"处理图像 {img_path} 时出错: {e}")
-    
-    print(f"成功处理 {processed_count} 张微多普勒时频图像")
+                # 如果输出文件已存在，则跳过
+                if os.path.exists(output_img_path):
+                    logger.debug(f"文件 {output_img_path} 已存在，跳过处理")
+                    processed_count += 1
+                    continue
+                    
+                try:
+                    # 读取图像
+                    img = Image.open(img_path)
+                    
+                    # 确保图像是RGB格式
+                    if img.mode != 'RGB':
+                        img = img.convert('RGB')
+                    
+                    # 应用转换
+                    processed_img = transform(img)
+                    
+                    # 转回PIL图像并保存
+                    processed_img = ((processed_img + 1.0) * 127.5).clamp(0, 255).permute(1, 2, 0).numpy().astype(np.uint8)
+                    processed_img = Image.fromarray(processed_img)
+                    processed_img.save(output_img_path)
+                    
+                    processed_count += 1
+                    
+                except Exception as e:
+                    logger.error(f"处理图像 {img_path} 时出错: {e}")
+        
+        logger.info(f"成功处理 {processed_count} 张微多普勒时频图像")
+    except Exception as e:
+        logger.error(f"预处理过程中发生错误: {e}")
 
 
 def parse_args():
@@ -172,12 +204,8 @@ def parse_args():
     parser.add_argument(
         "--train_data_dir",
         type=str,
-        default=None,
-        help=(
-            "A folder containing the training data. Folder contents must follow the structure described in"
-            " https://huggingface.co/docs/datasets/image_dataset#imagefolder. In particular, a `metadata.jsonl` file"
-            " must exist to provide the captions for the images. Ignored if `dataset_name` is specified."
-        ),
+        default="/kaggle/working/dataset",  # 设置默认值为dataset目录
+        help="A folder containing the training data.",
     )
     parser.add_argument(
         "--output_dir",
@@ -234,7 +262,7 @@ def parse_args():
     parser.add_argument("--num_epochs", type=int, default=150)
     parser.add_argument("--save_images_epochs", type=int, default=10, help="How often to save images during training.")
     parser.add_argument(
-        "--save_model_epochs", type=int, default=10, help="How often to save the model during training."
+        "--save_model_epochs", type=int, default=20, help="How often to save the model during training."
     )
     parser.add_argument(
         "--gradient_accumulation_steps",
@@ -329,7 +357,7 @@ def parse_args():
     parser.add_argument(
         "--checkpointing_steps",
         type=int,
-        default=500,
+        default=2500,  # 从500修改为2500，减少检查点保存频率
         help=(
             "Save a checkpoint of the training state every X updates. These checkpoints are only suitable for resuming"
             " training using `--resume_from_checkpoint`."
@@ -338,7 +366,7 @@ def parse_args():
     parser.add_argument(
         "--checkpoints_total_limit",
         type=int,
-        default=5,
+        default=1,  # 修改默认值为1，只保留最新的检查点
         help=("Max number of checkpoints to store."),
     )
     parser.add_argument(
@@ -379,13 +407,21 @@ def parse_args():
 
 
 def main(args):
-    # 处理微多普勒数据
-    if args.raw_data_dir is not None and args.processed_data_dir is not None and not args.preprocess_only:
+    # 确保shutil模块在所有作用域可用
+    import shutil
+    
+    # 处理微多普勒数据（如果需要）
+    if args.raw_data_dir is not None and args.processed_data_dir is not None:
         logger.info("检测到原始数据目录和处理后目录，执行数据预处理...")
         preprocess_microdoppler_data(args.raw_data_dir, args.processed_data_dir, args.resolution, args.max_samples)
         # 将处理后的数据目录设置为训练数据目录
         args.train_data_dir = args.processed_data_dir
         logger.info(f"预处理完成，将使用处理后的数据：{args.processed_data_dir}")
+    
+    # preprocess_only模式下不应该执行到这里，但为了安全起见
+    if args.preprocess_only:
+        logger.info("preprocess_only模式，跳过训练")
+        return
     
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
@@ -540,24 +576,102 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
+    # 加载数据集
     if args.dataset_name is not None:
+        # 从Hugging Face Hub下载数据集
         dataset = load_dataset(
             args.dataset_name,
             args.dataset_config_name,
             cache_dir=args.cache_dir,
             split="train",
         )
-    elif args.train_data_files is not None:
-        dataset = load_dataset("imagefolder", data_files=args.train_data_files, split="train")
     else:
-        dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
+        # 从本地加载数据集
+        try:
+            # 打印数据目录信息
+            logger.info(f"尝试从 {args.train_data_dir} 加载数据集")
+            if os.path.exists(args.train_data_dir):
+                logger.info(f"目录存在，内容: {os.listdir(args.train_data_dir)}")
+                
+                # 检查是否已有ID_x目录结构
+                has_id_dirs = any(d.startswith("ID_") for d in os.listdir(args.train_data_dir))
+                if has_id_dirs and accelerator.is_main_process:  # 只让主进程执行目录创建
+                    logger.info("检测到ID_x目录结构，创建符合imagefolder格式的目录...")
+                    # 创建train目录
+                    train_dir = os.path.join(args.train_data_dir, "train")
+                    os.makedirs(train_dir, exist_ok=True)
+                    
+                    # 将ID_x目录移动到train目录下
+                    for item in os.listdir(args.train_data_dir):
+                        if item.startswith("ID_") and os.path.isdir(os.path.join(args.train_data_dir, item)):
+                            src_dir = os.path.join(args.train_data_dir, item)
+                            dst_dir = os.path.join(train_dir, item)
+                            try:
+                                if not os.path.exists(dst_dir):
+                                    logger.info(f"复制目录 {item} 到 train/{item}")
+                                    # 使用copy_tree而不是copytree，手动实现目录复制以避免目录已存在错误
+                                    os.makedirs(dst_dir, exist_ok=True)
+                                    for file_name in os.listdir(src_dir):
+                                        src_file = os.path.join(src_dir, file_name)
+                                        dst_file = os.path.join(dst_dir, file_name)
+                                        if os.path.isfile(src_file) and not os.path.exists(dst_file):
+                                            shutil.copy2(src_file, dst_file)
+                                else:
+                                    logger.info(f"目录 train/{item} 已存在，检查文件是否需要复制")
+                                    # 检查并复制缺失的文件
+                                    for file_name in os.listdir(src_dir):
+                                        src_file = os.path.join(src_dir, file_name)
+                                        dst_file = os.path.join(dst_dir, file_name)
+                                        if os.path.isfile(src_file) and not os.path.exists(dst_file):
+                                            shutil.copy2(src_file, dst_file)
+                            except Exception as e:
+                                logger.warning(f"复制目录 {item} 时出错: {e}")
+                                # 继续处理其他目录
+                    
+                    logger.info(f"train目录结构创建完成，内容: {os.listdir(train_dir)}")
+                
+                # 确保所有进程等待主进程完成目录创建
+                accelerator.wait_for_everyone()
+            else:
+                logger.info(f"目录不存在，将创建")
+                os.makedirs(args.train_data_dir, exist_ok=True)
+                
+            # 尝试标准的imagefolder格式加载
+            dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
+        except ValueError as e:
+            if "corresponds to no data" in str(e):
+                logger.info("标准imagefolder格式加载失败，尝试直接加载图像...")
+                # 创建正确的目录结构
+                # 确保shutil可用
+                import shutil  # 重新导入以确保在此作用域可用
+                
+                # 只让主进程执行目录创建
+                if accelerator.is_main_process:
+                    train_dir = os.path.join(args.train_data_dir, "train")
+                    os.makedirs(train_dir, exist_ok=True)
+                    default_class_dir = os.path.join(train_dir, "default_class")
+                    os.makedirs(default_class_dir, exist_ok=True)
+                    
+                    # 移动所有图像到默认类别目录
+                    image_count = 0
+                    for file in os.listdir(args.train_data_dir):
+                        if file.lower().endswith((".jpg", ".jpeg", ".png")):
+                            src_path = os.path.join(args.train_data_dir, file)
+                            dst_path = os.path.join(default_class_dir, file)
+                            if not os.path.exists(dst_path):  # 避免重复复制
+                                shutil.copy(src_path, dst_path)  # 使用复制而不是移动，以保留原始文件
+                                image_count += 1
+                    
+                    logger.info(f"已复制 {image_count} 张图像到标准目录结构")
+                
+                # 确保所有进程等待主进程完成目录创建
+                accelerator.wait_for_everyone()
+                
+                # 重新尝试加载数据集
+                dataset = load_dataset("imagefolder", data_dir=args.train_data_dir, cache_dir=args.cache_dir, split="train")
+            else:
+                # 其他错误，直接抛出
+                raise
 
     # Preprocessing the datasets and DataLoaders creation.
     augmentations = transforms.Compose(
@@ -590,11 +704,15 @@ def main(args):
     )
 
     # Prepare everything with our `accelerator`.
-    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, lr_scheduler, vae = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler, vae
     )
 
-    vae = vae.to(accelerator.device, dtype=weight_dtype)
+    # 设置VAE模型的数据类型，但保留设备分配
+    if accelerator.mixed_precision == "fp16":
+        vae.to(dtype=torch.float16)
+    elif accelerator.mixed_precision == "bf16":
+        vae.to(dtype=torch.bfloat16)
 
     if args.use_ema:
         ema_model.to(accelerator.device)
@@ -659,6 +777,10 @@ def main(args):
 
             clean_images = batch["input"].to(weight_dtype)
             latents = vae.encode(clean_images).latents
+            
+            # 确保latents与weight_dtype一致
+            latents = latents.to(dtype=weight_dtype)
+            
             latents = latents * 0.18215#vae.config.scaling_factor
 
             # Sample noise that we'll add to the images
@@ -707,29 +829,19 @@ def main(args):
 
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
-                        # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(args.output_dir)
-                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
-
-                            # before we save the new checkpoint, we need to have at _most_ `checkpoints_total_limit - 1` checkpoints
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                                )
-                                logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
-
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(args.output_dir, removing_checkpoint)
-                                    shutil.rmtree(removing_checkpoint)
-
+                        # 强制清理所有现有检查点，确保只保留最新的
+                        checkpoints = os.listdir(args.output_dir)
+                        checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                        if len(checkpoints) > 0:
+                            logger.info(f"清理所有现有检查点，共 {len(checkpoints)} 个")
+                            for checkpoint in checkpoints:
+                                checkpoint_path = os.path.join(args.output_dir, checkpoint)
+                                logger.info(f"删除检查点: {checkpoint}")
+                                shutil.rmtree(checkpoint_path)
+                        
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
+                        logger.info(f"保存新检查点到 {save_path}")
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "step": global_step}
             if args.use_ema:
@@ -791,6 +903,21 @@ def main(args):
                     ema_model.store(unet.parameters())
                     ema_model.copy_to(unet.parameters())
 
+                # 清理旧的完整模型文件，减少存储空间占用
+                model_files = ["model_index.json", "scheduler", "unet"]
+                if args.use_ema:
+                    model_files.append("unet_ema")
+                
+                logger.info("清理旧的完整模型文件...")
+                for file_or_dir in model_files:
+                    path = os.path.join(args.output_dir, file_or_dir)
+                    if os.path.isdir(path):
+                        logger.info(f"删除目录: {file_or_dir}")
+                        shutil.rmtree(path, ignore_errors=True)
+                    elif os.path.isfile(path):
+                        logger.info(f"删除文件: {file_or_dir}")
+                        os.remove(path)
+
                 pipeline = UncondLatentDiffusionPipeline(
                     vae=vae,
                     unet=unet,
@@ -798,6 +925,7 @@ def main(args):
                 )
 
                 pipeline.save_pretrained(args.output_dir)
+                logger.info(f"保存完整模型到 {args.output_dir}")
 
                 if args.use_ema:
                     ema_model.restore(unet.parameters())
@@ -820,7 +948,17 @@ if __name__ == "__main__":
     if args.preprocess_only:
         if args.raw_data_dir is None or args.processed_data_dir is None:
             raise ValueError("When --preprocess_only is True, --raw_data_dir and --processed_data_dir must be specified.")
+        # 使用标准日志而非accelerate日志
+        import logging
+        logging.basicConfig(
+            format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+            datefmt="%m/%d/%Y %H:%M:%S",
+            level=logging.INFO,
+        )
+        logging.info("仅执行数据预处理...")
         preprocess_microdoppler_data(args.raw_data_dir, args.processed_data_dir, args.resolution, args.max_samples)
+        logging.info("预处理完成，退出程序")
+        exit(0)  # 添加退出语句，确保不继续执行
     else:
         # 检查必要的参数
         if args.dataset_name is None and args.train_data_files is None and args.train_data_dir is None:
