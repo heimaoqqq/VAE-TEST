@@ -372,13 +372,24 @@ def main():
         weight_dtype = torch.bfloat16
 
     # 加载模型: VAE, UNet, Scheduler
-    # 1. VAE
-    # 使用指定的VQ-VAE
-    vqvae_path = os.path.join(args.pretrained_vqvae_model_name_or_path, "vqvae")
-    if os.path.exists(vqvae_path):
-         vae = VQModel.from_pretrained(vqvae_path)
-    else:
-         vae = VQModel.from_pretrained(args.pretrained_vqvae_model_name_or_path, subfolder="vqvae")
+    # 1. VQ-VAE (使用VQ-diffusion预训练模型)
+    print(f"加载VQ-diffusion预训练VQ-VAE: {args.pretrained_vqvae_model_name_or_path}")
+
+    # VQ-diffusion使用的是标准的VQModel，通常从CompVis/ldm-celebahq-256加载
+    try:
+        # 首先尝试从本地路径加载
+        vqvae_path = os.path.join(args.pretrained_vqvae_model_name_or_path, "vqvae")
+        if os.path.exists(vqvae_path):
+            vae = VQModel.from_pretrained(vqvae_path)
+            print(f"从本地路径加载VQ-VAE: {vqvae_path}")
+        else:
+            # 从HuggingFace加载，通常是CompVis/ldm-celebahq-256
+            vae = VQModel.from_pretrained(args.pretrained_vqvae_model_name_or_path, subfolder="vqvae")
+            print(f"从HuggingFace加载VQ-VAE: {args.pretrained_vqvae_model_name_or_path}/vqvae")
+    except Exception as e:
+        print(f"VQ-VAE加载失败: {e}")
+        print("尝试使用默认的CompVis/ldm-celebahq-256...")
+        vae = VQModel.from_pretrained("CompVis/ldm-celebahq-256", subfolder="vqvae")
     
     # 2. Scheduler
     noise_scheduler = DDPMScheduler(
@@ -398,9 +409,8 @@ def main():
         num_class_embeds=args.num_users + 1,  # +1 用于无条件生成
     )
 
-    # 冻结VAE并确保使用float32避免混合精度问题
+    # 冻结VAE
     vae.requires_grad_(False)
-    vae = vae.float()  # 强制VAE使用float32
     
     # 启用xformers以节省内存
     if args.enable_xformers_memory_efficient_attention:
@@ -469,13 +479,14 @@ def main():
             model_config=unet.config
         )
 
-    # 准备所有组件 - VAE不使用混合精度以避免类型问题
+    # 准备所有组件
     unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
         unet, optimizer, dataloader, lr_scheduler
     )
 
-    # VAE手动移动到设备但不使用混合精度
+    # VAE移动到设备并设置为评估模式
     vae = vae.to(accelerator.device)
+    vae.eval()
 
     if args.use_ema:
         ema_unet.to(accelerator.device)
@@ -524,13 +535,19 @@ def main():
         
         for step, batch in enumerate(epoch_progress_bar):
             with accelerator.accumulate(unet):
-                # 将图像编码到潜在空间 - VAE使用float32避免类型问题
+                # 将图像编码到潜在空间
                 with torch.no_grad():
-                    pixel_values = batch["pixel_values"].to(accelerator.device, dtype=torch.float32)
-                    latents = vae.encode(pixel_values).latents
+                    pixel_values = batch["pixel_values"].to(accelerator.device)
+                    # 使用autocast确保VAE编码的类型一致性
+                    with accelerator.autocast():
+                        latents = vae.encode(pixel_values).latents
 
-                # 修复：添加与无条件训练一致的scaling factor
-                latents = latents * 0.18215
+                # 使用VQ-VAE配置中的scaling factor
+                if hasattr(vae.config, 'scaling_factor'):
+                    latents = latents * vae.config.scaling_factor
+                else:
+                    # VQ-diffusion默认scaling factor
+                    latents = latents * 0.18215
 
                 # 添加噪声
                 noise = torch.randn_like(latents)
