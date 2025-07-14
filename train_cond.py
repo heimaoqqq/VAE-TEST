@@ -468,9 +468,9 @@ def main():
             model_config=unet.config
         )
 
-    # 准备所有组件
-    unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, dataloader, lr_scheduler
+    # 准备所有组件 - 包括VAE以确保混合精度处理正确
+    unet, vae, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+        unet, vae, optimizer, dataloader, lr_scheduler
     )
 
     if args.use_ema:
@@ -520,8 +520,13 @@ def main():
         
         for step, batch in enumerate(epoch_progress_bar):
             with accelerator.accumulate(unet):
-                # 将图像编码到潜在空间
-                latents = vae.encode(batch["pixel_values"].to(accelerator.device)).latents
+                # 将图像编码到潜在空间 - 确保数据类型匹配
+                with torch.no_grad():
+                    pixel_values = batch["pixel_values"].to(accelerator.device)
+                    # 如果使用混合精度，确保输入数据类型与VAE权重匹配
+                    if accelerator.mixed_precision == "fp16":
+                        pixel_values = pixel_values.half()
+                    latents = vae.encode(pixel_values).latents
 
                 # 修复：添加与无条件训练一致的scaling factor
                 latents = latents * 0.18215
