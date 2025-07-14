@@ -395,20 +395,6 @@ def main():
         sample_size=latent_size,
         in_channels=3,  # 修复：与无条件训练保持一致，使用固定的3通道
         out_channels=3,  # 修复：与无条件训练保持一致，使用固定的3通道
-        layers_per_block=2,
-        block_out_channels=(128, 256, 512, 512), # 与train.py对齐
-        down_block_types=(
-            "DownBlock2D",
-            "DownBlock2D",
-            "AttnDownBlock2D",
-            "DownBlock2D"
-        ),
-        up_block_types=(
-            "UpBlock2D",
-            "AttnUpBlock2D",
-            "UpBlock2D",
-            "UpBlock2D"
-        ),
         num_class_embeds=args.num_users + 1,  # +1 用于无条件生成
     )
 
