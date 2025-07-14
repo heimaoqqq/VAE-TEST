@@ -398,8 +398,9 @@ def main():
         num_class_embeds=args.num_users + 1,  # +1 用于无条件生成
     )
 
-    # 冻结VAE
+    # 冻结VAE并确保使用float32避免混合精度问题
     vae.requires_grad_(False)
+    vae = vae.float()  # 强制VAE使用float32
     
     # 启用xformers以节省内存
     if args.enable_xformers_memory_efficient_attention:
@@ -468,10 +469,13 @@ def main():
             model_config=unet.config
         )
 
-    # 准备所有组件 - 包括VAE以确保混合精度处理正确
-    unet, vae, optimizer, dataloader, lr_scheduler = accelerator.prepare(
-        unet, vae, optimizer, dataloader, lr_scheduler
+    # 准备所有组件 - VAE不使用混合精度以避免类型问题
+    unet, optimizer, dataloader, lr_scheduler = accelerator.prepare(
+        unet, optimizer, dataloader, lr_scheduler
     )
+
+    # VAE手动移动到设备但不使用混合精度
+    vae = vae.to(accelerator.device)
 
     if args.use_ema:
         ema_unet.to(accelerator.device)
@@ -520,12 +524,9 @@ def main():
         
         for step, batch in enumerate(epoch_progress_bar):
             with accelerator.accumulate(unet):
-                # 将图像编码到潜在空间 - 确保数据类型匹配
+                # 将图像编码到潜在空间 - VAE使用float32避免类型问题
                 with torch.no_grad():
-                    pixel_values = batch["pixel_values"].to(accelerator.device)
-                    # 如果使用混合精度，确保输入数据类型与VAE权重匹配
-                    if accelerator.mixed_precision == "fp16":
-                        pixel_values = pixel_values.half()
+                    pixel_values = batch["pixel_values"].to(accelerator.device, dtype=torch.float32)
                     latents = vae.encode(pixel_values).latents
 
                 # 修复：添加与无条件训练一致的scaling factor
