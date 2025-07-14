@@ -103,8 +103,12 @@ class CondLatentDiffusionPipeline(LatentDiffusionPipelineBase):
         """
         print(f"解码latents，形状: {latents.shape}, 类型: {latents.dtype}")
 
-        # 修复：使用与训练一致的scaling factor
-        latents = latents / 0.18215
+        # 使用VQ-VAE配置中的scaling factor
+        if hasattr(self.vqvae.config, 'scaling_factor'):
+            latents = latents / self.vqvae.config.scaling_factor
+        else:
+            # VQ-diffusion默认scaling factor
+            latents = latents / 0.18215
         
         # 确保latents与vae的数据类型一致
         dtype = None
