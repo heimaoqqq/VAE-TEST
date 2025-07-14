@@ -485,14 +485,11 @@ def main():
     )
 
     # VAE移动到设备并设置为评估模式
-    vae = vae.to(accelerator.device)
+    vae = vae.to(accelerator.device, dtype=weight_dtype)
     vae.eval()
 
     if args.use_ema:
         ema_unet.to(accelerator.device)
-
-    # 将模型移动到设备
-    vae.to(accelerator.device, dtype=weight_dtype)
 
     # 计算总训练步数
     num_update_steps_per_epoch = math.ceil(len(dataloader) / args.gradient_accumulation_steps)
